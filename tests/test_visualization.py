@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from differentiable_humanoid_dynamics.visualization import _floor_geometry_from_states
+from differentiable_humanoid_dynamics.visualization import (
+    _animation_status,
+    _clamp_frame,
+    _floor_geometry_from_states,
+)
 
 
 def test_floor_geometry_covers_motion_extent() -> None:
@@ -36,3 +40,23 @@ def test_floor_geometry_uses_minimum_size_for_short_clips() -> None:
 def test_floor_geometry_rejects_bad_state_shape() -> None:
     with pytest.raises(ValueError, match="Expected states"):
         _floor_geometry_from_states(torch.zeros(3))
+
+
+def test_clamp_frame_bounds_indices() -> None:
+    assert _clamp_frame(-4, 10) == 0
+    assert _clamp_frame(3, 10) == 3
+    assert _clamp_frame(15, 10) == 9
+
+
+def test_clamp_frame_rejects_empty_sequences() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        _clamp_frame(0, 0)
+
+
+def test_animation_status_includes_motion_and_frame() -> None:
+    assert _animation_status(
+        motion_label="walk",
+        frame=4,
+        num_frames=12,
+        playing=False,
+    ) == "Paused | walk | frame 5/12"

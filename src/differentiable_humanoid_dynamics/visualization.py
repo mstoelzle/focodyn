@@ -1,17 +1,37 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 
 import numpy as np
 import torch
 
 from .dynamics import HumanoidDynamics
-from .motion import default_g1_motion_reference, load_kinematic_motion_reference
+from .motion import (
+    EMBER_G1_MOTION_REFERENCE,
+    bundled_motion_reference_path,
+    default_g1_motion_reference,
+    load_kinematic_motion_reference,
+)
 from .walking import simple_walking_sequence
+
+
+@dataclass(frozen=True)
+class _ViewerMotion:
+    """Kinematic motion sequence available in the viewer.
+
+    Attributes:
+        label: GUI-facing motion name.
+        states: State trajectory with shape ``(frames, state_dim)``.
+    """
+
+    label: str
+    states: torch.Tensor
 
 
 def run_contact_viewer(
@@ -63,14 +83,16 @@ def run_contact_viewer(
     if model.contact_model is None:
         raise RuntimeError("Contact model was not initialized.")
 
-    if synthetic_motion:
-        states, _ = simple_walking_sequence(model, frames=180, dt=1.0 / fps)
-    elif motion_reference is None:
-        states = default_g1_motion_reference(model).states
-    else:
-        states = load_kinematic_motion_reference(motion_reference, model).states
+    motion_options, initial_motion_label = _load_viewer_motion_options(
+        model,
+        fps=fps,
+        motion_reference=motion_reference,
+        synthetic_motion=synthetic_motion,
+    )
+    states = motion_options[initial_motion_label].states
 
-    floor_width, floor_height, floor_position = _floor_geometry_from_states(states)
+    floor_states = torch.cat([motion.states for motion in motion_options.values()], dim=0)
+    floor_width, floor_height, floor_position = _floor_geometry_from_states(floor_states)
 
     server = viser.ViserServer(port=port)
     floor_thickness = 0.018
@@ -125,11 +147,65 @@ def run_contact_viewer(
         for name in model.contact_model.contact_names
     ]
 
-    frame = 0
-    frames_rendered = 0
-    period = 1.0 / fps
-    while True:
-        state = states[frame]
+    playback_lock = threading.RLock()
+    playback = {
+        "motion_label": initial_motion_label,
+        "states": states,
+        "frame": 0,
+        "playing": True,
+        "suppress_slider_callback": False,
+    }
+    max_frame_index = max(motion.states.shape[0] for motion in motion_options.values()) - 1
+
+    with server.gui.add_folder("Animation", expand_by_default=True):
+        motion_dropdown = server.gui.add_dropdown(
+            "Motion",
+            tuple(motion_options),
+            initial_value=initial_motion_label,
+            hint="Kinematic sequence to visualize.",
+        )
+        play_button = server.gui.add_button(
+            "Play",
+            hint="Start playback from the current frame.",
+        )
+        pause_button = server.gui.add_button(
+            "Pause",
+            hint="Pause playback at the current frame.",
+        )
+        reset_button = server.gui.add_button(
+            "Reset",
+            hint="Return to frame zero and pause playback.",
+        )
+        frame_slider = server.gui.add_slider(
+            "Frame",
+            min=0,
+            max=max_frame_index,
+            step=1,
+            initial_value=0,
+            hint="Scrub the sequence. Scrubbing pauses playback.",
+        )
+        status_text = server.gui.add_text(
+            "Status",
+            _animation_status(
+                motion_label=initial_motion_label,
+                frame=0,
+                num_frames=states.shape[0],
+                playing=True,
+            ),
+            disabled=True,
+        )
+
+    def render_frame(sequence: torch.Tensor, frame_index: int) -> None:
+        """Render one motion frame and its contact frames.
+
+        Args:
+            sequence: State trajectory with shape ``(frames, state_dim)``.
+            frame_index: Frame index to render.
+
+        Returns:
+            None.
+        """
+        state = sequence[frame_index]
         split = model.split_state(state)
         joint_positions = split.joint_positions.squeeze(0).detach().cpu().numpy()
         base_position = split.base_position.squeeze(0).detach().cpu().numpy()
@@ -143,18 +219,8 @@ def run_contact_viewer(
             base_transform,
             split.joint_positions.squeeze(0),
         )
-        contact_positions = (
-            contact_poses.positions
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        contact_quaternions = (
-            contact_poses.quaternions_wxyz
-            .detach()
-            .cpu()
-            .numpy()
-        )
+        contact_positions = contact_poses.positions.detach().cpu().numpy()
+        contact_quaternions = contact_poses.quaternions_wxyz.detach().cpu().numpy()
         for handle, frame_handle, point, quat in zip(
             contact_handles,
             contact_frame_handles,
@@ -165,7 +231,118 @@ def run_contact_viewer(
             frame_handle.position = tuple(float(value) for value in point)
             frame_handle.wxyz = tuple(float(value) for value in quat)
 
-        frame = (frame + 1) % len(states)
+    def sync_controls() -> None:
+        """Synchronize GUI widgets from the current playback state.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        playback["frame"] = _clamp_frame(int(playback["frame"]), playback["states"].shape[0])
+        playback["suppress_slider_callback"] = True
+        frame_slider.value = int(playback["frame"])
+        playback["suppress_slider_callback"] = False
+        status_text.value = _animation_status(
+            motion_label=str(playback["motion_label"]),
+            frame=int(playback["frame"]),
+            num_frames=playback["states"].shape[0],
+            playing=bool(playback["playing"]),
+        )
+
+    @play_button.on_click
+    def _(_) -> None:
+        """Start animation playback from the GUI.
+
+        Args:
+            _: Viser button event.
+
+        Returns:
+            None.
+        """
+        with playback_lock:
+            playback["playing"] = True
+            sync_controls()
+
+    @pause_button.on_click
+    def _(_) -> None:
+        """Pause animation playback from the GUI.
+
+        Args:
+            _: Viser button event.
+
+        Returns:
+            None.
+        """
+        with playback_lock:
+            playback["playing"] = False
+            sync_controls()
+
+    @reset_button.on_click
+    def _(_) -> None:
+        """Reset the sequence to its first frame from the GUI.
+
+        Args:
+            _: Viser button event.
+
+        Returns:
+            None.
+        """
+        with playback_lock:
+            playback["frame"] = 0
+            playback["playing"] = False
+            sync_controls()
+            render_frame(playback["states"], int(playback["frame"]))
+
+    @frame_slider.on_update
+    def _(_) -> None:
+        """Scrub to a frame selected by the GUI slider.
+
+        Args:
+            _: Viser slider event.
+
+        Returns:
+            None.
+        """
+        with playback_lock:
+            if playback["suppress_slider_callback"]:
+                return
+            playback["frame"] = _clamp_frame(int(frame_slider.value), playback["states"].shape[0])
+            playback["playing"] = False
+            sync_controls()
+            render_frame(playback["states"], int(playback["frame"]))
+
+    @motion_dropdown.on_update
+    def _(_) -> None:
+        """Switch the displayed kinematic motion from the GUI dropdown.
+
+        Args:
+            _: Viser dropdown event.
+
+        Returns:
+            None.
+        """
+        with playback_lock:
+            label = str(motion_dropdown.value)
+            playback["motion_label"] = label
+            playback["states"] = motion_options[label].states
+            playback["frame"] = 0
+            playback["playing"] = False
+            sync_controls()
+            render_frame(playback["states"], int(playback["frame"]))
+
+    frames_rendered = 0
+    period = 1.0 / fps
+    while True:
+        with playback_lock:
+            frame = _clamp_frame(int(playback["frame"]), playback["states"].shape[0])
+            sequence = playback["states"]
+            playing = bool(playback["playing"])
+            render_frame(sequence, frame)
+            playback["frame"] = (frame + 1) % sequence.shape[0] if playing else frame
+            sync_controls()
+
         frames_rendered += 1
         if max_frames is not None and frames_rendered >= max_frames:
             sys.stdout.flush()
@@ -243,3 +420,97 @@ def _floor_geometry_from_states(
     height = max(min_height, float(span[1]) + 2.0 * margin)
     position = (float(center[0]), float(center[1]), 0.0)
     return width, height, position
+
+
+def _load_viewer_motion_options(
+    model: HumanoidDynamics,
+    *,
+    fps: float,
+    motion_reference: str | Path | None,
+    synthetic_motion: bool,
+) -> tuple[dict[str, _ViewerMotion], str]:
+    """Load kinematic motion choices shown in the Viser GUI.
+
+    Args:
+        model: Humanoid dynamics model used to map motions into state tensors.
+        fps: Frame rate used for the deterministic synthetic fallback.
+        motion_reference: Optional user-specified motion path.
+        synthetic_motion: Whether the synthetic fallback should be selected
+            initially.
+
+    Returns:
+        Tuple ``(motion_options, initial_label)``. ``motion_options`` maps GUI
+        labels to loaded motion sequences, and ``initial_label`` is one of its
+        keys.
+    """
+    options: dict[str, _ViewerMotion] = {}
+
+    default_motion = default_g1_motion_reference(model)
+    default_label = "Fleaven JOOF walk (default)"
+    options[default_label] = _ViewerMotion(default_label, default_motion.states)
+
+    ember_motion = load_kinematic_motion_reference(
+        bundled_motion_reference_path(EMBER_G1_MOTION_REFERENCE),
+        model,
+        source_name="CMU 06_01 retargeted AMASS for Unitree G1",
+    )
+    ember_label = "Ember CMU 06_01"
+    options[ember_label] = _ViewerMotion(ember_label, ember_motion.states)
+
+    synthetic_states, _ = simple_walking_sequence(model, frames=180, dt=1.0 / fps)
+    synthetic_label = "Synthetic fallback"
+    options[synthetic_label] = _ViewerMotion(synthetic_label, synthetic_states)
+
+    custom_label = None
+    if motion_reference is not None:
+        custom_motion = load_kinematic_motion_reference(motion_reference, model)
+        custom_label = f"Custom: {Path(motion_reference).name}"
+        options[custom_label] = _ViewerMotion(custom_label, custom_motion.states)
+
+    if synthetic_motion:
+        initial_label = synthetic_label
+    elif custom_label is not None:
+        initial_label = custom_label
+    else:
+        initial_label = default_label
+    return options, initial_label
+
+
+def _clamp_frame(frame: int, num_frames: int) -> int:
+    """Clamp a requested frame index to a valid sequence index.
+
+    Args:
+        frame: Requested frame index.
+        num_frames: Number of frames in the active sequence.
+
+    Returns:
+        Clamped frame index in ``[0, num_frames - 1]``.
+
+    Raises:
+        ValueError: If ``num_frames`` is not positive.
+    """
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive.")
+    return min(max(frame, 0), num_frames - 1)
+
+
+def _animation_status(
+    *,
+    motion_label: str,
+    frame: int,
+    num_frames: int,
+    playing: bool,
+) -> str:
+    """Format playback state for the Viser GUI.
+
+    Args:
+        motion_label: Name of the active motion sequence.
+        frame: Current zero-based frame index.
+        num_frames: Number of frames in the active sequence.
+        playing: Whether playback is currently active.
+
+    Returns:
+        Human-readable status string.
+    """
+    state = "Playing" if playing else "Paused"
+    return f"{state} | {motion_label} | frame {frame + 1}/{num_frames}"

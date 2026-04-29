@@ -132,6 +132,8 @@ uv run --extra viz python examples/visualize_g1_contacts.py
 
 The viewer loads the local G1 URDF, plays the bundled retargeted AMASS/G1
 kinematic reference, and overlays the differentiable contact-frame FK estimates.
+The Viser side panel includes playback buttons, a frame scrubber, and a motion
+dropdown for switching between bundled kinematic references.
 Pass `--synthetic-motion` to recover the older deterministic fallback sequence,
 or `--motion-reference /path/to/file.npz` / `--motion-reference /path/to/file.npy`
 to visualize another supported retargeted G1 motion.
