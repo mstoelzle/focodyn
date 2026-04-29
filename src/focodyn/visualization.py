@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
+from typing import Iterator
 from typing import Literal
 
 import numpy as np
@@ -38,6 +44,191 @@ class _ViewerMotion:
     label: str
     states: torch.Tensor
     times: torch.Tensor
+
+
+class _FfmpegVideoWriter:
+    """Stream RGB frames into an H.264 MP4 with the system ffmpeg binary."""
+
+    def __init__(self, output_path: Path, *, width: int, height: int, fps: float) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("Video width and height must be positive.")
+        if width % 2 != 0 or height % 2 != 0:
+            raise ValueError("H.264 export requires even video width and height.")
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("Could not find `ffmpeg`; install ffmpeg or add it to PATH.")
+        self.output_path = output_path
+        self.width = int(width)
+        self.height = int(height)
+        self._closed = False
+        self._process = subprocess.Popen(
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "rawvideo",
+                "-vcodec",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{self.width}x{self.height}",
+                "-r",
+                f"{float(fps):.6f}",
+                "-i",
+                "-",
+                "-an",
+                "-vcodec",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                str(output_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def __enter__(self) -> _FfmpegVideoWriter:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.terminate()
+
+    def write(self, frame: np.ndarray) -> None:
+        """Write one RGB/RGBA frame."""
+        if self._closed:
+            raise RuntimeError("Cannot write to a closed video writer.")
+        if self._process.stdin is None:
+            raise RuntimeError("ffmpeg stdin is not available.")
+        frame_array = np.asarray(frame)
+        if frame_array.shape[:2] != (self.height, self.width) or frame_array.ndim != 3:
+            raise ValueError(
+                f"Expected frame shape ({self.height}, {self.width}, 3/4), got {frame_array.shape}."
+            )
+        if frame_array.shape[2] == 4:
+            frame_array = frame_array[..., :3]
+        if frame_array.shape[2] != 3:
+            raise ValueError(f"Expected RGB/RGBA frames, got {frame_array.shape[2]} channels.")
+        if frame_array.dtype != np.uint8:
+            frame_array = np.clip(frame_array, 0, 255).astype(np.uint8)
+        try:
+            self._process.stdin.write(np.ascontiguousarray(frame_array).tobytes())
+        except BrokenPipeError as exc:
+            stderr = self._read_stderr()
+            raise RuntimeError(f"ffmpeg stopped while writing {self.output_path}.\n{stderr}") from exc
+
+    def close(self) -> None:
+        """Finish the video and check ffmpeg's exit status."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.stdin is not None:
+            self._process.stdin.close()
+            self._process.stdin = None
+        _, stderr_bytes = self._process.communicate()
+        if self._process.returncode != 0:
+            stderr = stderr_bytes.decode(errors="replace")
+            raise RuntimeError(f"ffmpeg failed while writing {self.output_path}.\n{stderr}")
+
+    def terminate(self) -> None:
+        """Stop ffmpeg after an upstream export failure."""
+        if self._closed:
+            return
+        self._closed = True
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait()
+
+    def _read_stderr(self) -> str:
+        if self._process.stderr is None:
+            return ""
+        try:
+            return self._process.stderr.read().decode(errors="replace")
+        except OSError:
+            return ""
+
+
+def _find_headless_browser_executable(browser_executable: str | Path | None = None) -> str:
+    """Find a Chromium-compatible browser for headless Viser rendering."""
+    candidates: list[str | Path | None] = [
+        browser_executable,
+        os.environ.get("FOCODYN_HEADLESS_BROWSER"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("Microsoft Edge"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        path = Path(candidate)
+        if path.exists():
+            return str(path)
+    raise RuntimeError(
+        "Could not find a headless Chromium-compatible browser. Set FOCODYN_HEADLESS_BROWSER "
+        "or pass --export-browser."
+    )
+
+
+def _find_available_port() -> int:
+    """Return an available local TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@contextlib.contextmanager
+def _launch_headless_browser(
+    *,
+    url: str,
+    width: int,
+    height: int,
+    browser_executable: str | Path | None,
+) -> Iterator[subprocess.Popen[bytes]]:
+    """Launch a temporary headless browser tab for Viser render requests."""
+    executable = _find_headless_browser_executable(browser_executable)
+    with tempfile.TemporaryDirectory(prefix="focodyn-viser-browser-") as user_data_dir:
+        process = subprocess.Popen(
+            [
+                executable,
+                "--headless=new",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--hide-scrollbars",
+                "--mute-audio",
+                "--enable-webgl",
+                "--ignore-gpu-blocklist",
+                "--enable-unsafe-swiftshader",
+                f"--user-data-dir={user_data_dir}",
+                f"--window-size={width + 420},{height + 160}",
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            yield process
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 class KinematicTrajectoryViewer:
@@ -84,7 +275,7 @@ class KinematicTrajectoryViewer:
         self.contact_mode = contact_mode
         self.contact_force_frame = contact_force_frame
         self.fps = float(fps)
-        self.port = int(port)
+        self.port = _find_available_port() if int(port) == 0 else int(port)
         self.load_meshes = bool(load_meshes)
         self.robot_opacity = float(np.clip(robot_opacity, 0.0, 1.0))
         self.max_frames = max_frames
@@ -155,10 +346,116 @@ class KinematicTrajectoryViewer:
                 os._exit(0)
             time.sleep(period)
 
+    def export_video(
+        self,
+        output_path: str | Path,
+        *,
+        width: int = 1280,
+        height: int = 720,
+        frame_count: int | None = None,
+        browser_executable: str | Path | None = None,
+        client_timeout: float = 30.0,
+        render_wait: float = 0.03,
+    ) -> Path:
+        """Export the active motion as an H.264 video using Viser client renders."""
+        try:
+            import viser
+            from viser.extras import ViserUrdf
+        except ImportError as exc:
+            raise ImportError("Install visualization extras with `uv sync --extra viz`.") from exc
+
+        output = Path(output_path).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        self.server = viser.ViserServer(port=self.port)
+        try:
+            self._setup_scene(ViserUrdf)
+            self._setup_gui()
+            motion = self.active_motion
+            total_frames = motion.states.shape[0]
+            if frame_count is not None:
+                total_frames = min(total_frames, int(frame_count))
+            if total_frames <= 0:
+                raise ValueError("Video export requires at least one frame.")
+
+            with self.playback_lock:
+                self.playback["playing"] = False
+                self.playback["frame"] = 0
+                self._sync_controls()
+                self._render_frame(motion, 0)
+            self.server.flush()
+
+            url = f"http://localhost:{self.server.get_port()}"
+            with _launch_headless_browser(
+                url=url,
+                width=width,
+                height=height,
+                browser_executable=browser_executable,
+            ) as browser_process:
+                client = self._wait_for_render_client(client_timeout, browser_process)
+                self._configure_export_camera(client, motion)
+                time.sleep(max(render_wait, 0.0) + 0.2)
+                with _FfmpegVideoWriter(output, width=width, height=height, fps=self.fps) as writer:
+                    for frame_index in range(total_frames):
+                        with self.playback_lock:
+                            self.playback["frame"] = frame_index
+                            self.playback["playing"] = False
+                            self._sync_controls()
+                            self._render_frame(motion, frame_index)
+                        self.server.flush()
+                        if render_wait > 0.0:
+                            time.sleep(render_wait)
+                        writer.write(client.get_render(height=height, width=width))
+                        if frame_index == 0 or (frame_index + 1) % 30 == 0 or frame_index + 1 == total_frames:
+                            print(f"Exported {frame_index + 1}/{total_frames} frames to {output}", flush=True)
+        finally:
+            self.server.stop()
+            self.server = None
+        return output
+
     @property
     def active_motion(self) -> _ViewerMotion:
         """Return the currently selected motion."""
         return self.playback["motion"]
+
+    def _wait_for_render_client(
+        self,
+        timeout: float,
+        browser_process: subprocess.Popen[bytes] | None,
+    ) -> Any:
+        """Wait until Viser has a browser client that can answer render requests."""
+        assert self.server is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            clients = self.server.get_clients()
+            if clients:
+                return next(iter(clients.values()))
+            if browser_process is not None and browser_process.poll() is not None:
+                stderr = ""
+                if browser_process.stderr is not None:
+                    stderr = browser_process.stderr.read().decode(errors="replace")
+                raise RuntimeError(f"Headless browser exited before connecting to Viser.\n{stderr}")
+            time.sleep(0.05)
+        raise TimeoutError(f"Timed out after {timeout:.1f}s waiting for a Viser browser client.")
+
+    def _configure_export_camera(self, client: Any, motion: _ViewerMotion) -> None:
+        """Set a stable overview camera for exported videos."""
+        states = motion.states.detach().cpu()
+        xy = states[:, :2]
+        lower = torch.amin(xy, dim=0).numpy()
+        upper = torch.amax(xy, dim=0).numpy()
+        center_xy = 0.5 * (lower + upper)
+        span_xy = upper - lower
+        distance = max(3.0, float(np.max(span_xy)) * 1.2)
+        look_at = np.array([center_xy[0], center_xy[1], 0.75], dtype=np.float64)
+        client.camera.position = (
+            float(center_xy[0] - 0.8 * distance),
+            float(center_xy[1] - 1.25 * distance),
+            float(0.65 * distance + 1.1),
+        )
+        client.camera.look_at = tuple(float(value) for value in look_at)
+        client.camera.up_direction = (0.0, 0.0, 1.0)
+        client.camera.fov = float(np.deg2rad(45.0))
+        client.flush()
 
     def _setup_scene(self, ViserUrdf) -> None:
         """Create static scene objects and robot/contact handles."""
@@ -919,6 +1216,66 @@ def run_dynamics_verification_viewer(
     ).run()
 
 
+def export_dynamics_verification_videos(
+    *,
+    output_dir: str | Path,
+    asset_name: str = "unitree_g1",
+    contact_mode: str = "feet_corners",
+    contact_force_frame: Literal["world", "contact"] = "world",
+    fps: float = 30.0,
+    port: int = 8080,
+    load_meshes: bool = True,
+    robot_opacity: float = 0.35,
+    max_frames: int | None = None,
+    motion_reference: str | Path | None = None,
+    synthetic_motion: bool = False,
+    whittaker_lmbda: float = 100.0,
+    whittaker_d_order: int = 2,
+    contact_threshold: float = 0.025,
+    top_joint_count: int = 8,
+    width: int = 1280,
+    height: int = 720,
+    frame_count: int | None = None,
+    browser_executable: str | Path | None = None,
+) -> tuple[Path, Path]:
+    """Export separate videos for the ``f(x)`` and ``g(x)`` dynamics views."""
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    export_frame_count = frame_count if frame_count is not None else max_frames
+    outputs: list[Path] = []
+    for mode, filename in (
+        (DynamicsVerificationViewer.F_MODE, "f_x_verification.mp4"),
+        (DynamicsVerificationViewer.G_MODE, "g_x_verification.mp4"),
+    ):
+        viewer = DynamicsVerificationViewer(
+            asset_name=asset_name,
+            contact_mode=contact_mode,
+            contact_force_frame=contact_force_frame,
+            fps=fps,
+            port=port,
+            load_meshes=load_meshes,
+            robot_opacity=robot_opacity,
+            max_frames=None,
+            motion_reference=motion_reference,
+            synthetic_motion=synthetic_motion,
+            whittaker_lmbda=whittaker_lmbda,
+            whittaker_d_order=whittaker_d_order,
+            contact_threshold=contact_threshold,
+            top_joint_count=top_joint_count,
+        )
+        viewer.dynamics_mode = mode
+        outputs.append(
+            viewer.export_video(
+                output_root / filename,
+                width=width,
+                height=height,
+                frame_count=export_frame_count,
+                browser_executable=browser_executable,
+            )
+        )
+    return outputs[0], outputs[1]
+
+
 def main() -> None:
     """Parse CLI arguments and launch a Viser viewer."""
     parser = argparse.ArgumentParser(description="Visualize Unitree G1 trajectories and dynamics.")
@@ -937,6 +1294,12 @@ def main() -> None:
     parser.add_argument("--whittaker-d-order", type=int, default=2)
     parser.add_argument("--contact-threshold", type=float, default=0.025)
     parser.add_argument("--top-joints", type=int, default=8)
+    parser.add_argument("--export-video", type=Path, default=None)
+    parser.add_argument("--export-dynamics-videos", type=Path, default=None)
+    parser.add_argument("--export-width", type=int, default=1280)
+    parser.add_argument("--export-height", type=int, default=720)
+    parser.add_argument("--export-frames", type=int, default=None)
+    parser.add_argument("--export-browser", type=Path, default=None)
     args = parser.parse_args()
 
     robot_opacity = args.robot_opacity
@@ -953,6 +1316,46 @@ def main() -> None:
         motion_reference=args.motion_reference,
         synthetic_motion=args.synthetic_motion,
     )
+    if args.export_dynamics_videos is not None:
+        export_dynamics_verification_videos(
+            **kwargs,
+            output_dir=args.export_dynamics_videos,
+            contact_force_frame=args.contact_force_frame,
+            whittaker_lmbda=args.whittaker_lambda,
+            whittaker_d_order=args.whittaker_d_order,
+            contact_threshold=args.contact_threshold,
+            top_joint_count=args.top_joints,
+            width=args.export_width,
+            height=args.export_height,
+            frame_count=args.export_frames,
+            browser_executable=args.export_browser,
+        )
+        return
+    if args.export_video is not None:
+        if args.dynamics_verification:
+            DynamicsVerificationViewer(
+                **kwargs,
+                contact_force_frame=args.contact_force_frame,
+                whittaker_lmbda=args.whittaker_lambda,
+                whittaker_d_order=args.whittaker_d_order,
+                contact_threshold=args.contact_threshold,
+                top_joint_count=args.top_joints,
+            ).export_video(
+                args.export_video,
+                width=args.export_width,
+                height=args.export_height,
+                frame_count=args.export_frames,
+                browser_executable=args.export_browser,
+            )
+        else:
+            KinematicTrajectoryViewer(**kwargs).export_video(
+                args.export_video,
+                width=args.export_width,
+                height=args.export_height,
+                frame_count=args.export_frames,
+                browser_executable=args.export_browser,
+            )
+        return
     if args.dynamics_verification:
         run_dynamics_verification_viewer(
             **kwargs,
