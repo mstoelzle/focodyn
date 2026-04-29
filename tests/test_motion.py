@@ -6,7 +6,9 @@ from focodyn import (
     FloatingBaseDynamics,
     bundled_motion_reference_path,
     default_g1_motion_reference,
+    estimate_motion_derivatives,
     load_kinematic_motion_reference,
+    simple_walking_sequence,
 )
 from focodyn.motion import EMBER_G1_MOTION_REFERENCE
 
@@ -64,3 +66,24 @@ def test_bundled_g1_motion_contact_heights_are_grounded() -> None:
     assert torch.min(heights) < 0.03
     assert torch.max(heights) > 0.08
     assert torch.mean(normals[stance, 2]) > 0.9
+
+
+def test_whittaker_motion_derivative_estimate_shapes() -> None:
+    import pytest
+
+    pytest.importorskip("torch_dxdt")
+    model = FloatingBaseDynamics("unitree_g1", dtype=torch.float64)
+    states, times = simple_walking_sequence(model, frames=24, dt=1.0 / 60.0)
+
+    estimate = estimate_motion_derivatives(model, states, times, lmbda=10.0)
+
+    assert estimate.states.shape == states.shape
+    assert estimate.generalized_accelerations.shape == (states.shape[0], model.nv)
+    assert estimate.configurations.shape == (states.shape[0], model.nq)
+    assert torch.isfinite(estimate.states).all()
+    assert torch.isfinite(estimate.generalized_accelerations).all()
+    assert torch.allclose(
+        torch.linalg.norm(estimate.states[:, 3:7], dim=-1),
+        torch.ones(states.shape[0], dtype=model.dtype),
+        atol=1e-7,
+    )

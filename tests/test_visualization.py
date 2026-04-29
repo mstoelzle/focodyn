@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from focodyn.visualization import (
+    KinematicTrajectoryViewer,
     _animation_status,
     _clamp_frame,
     _floor_geometry_from_states,
@@ -60,3 +61,12 @@ def test_animation_status_includes_motion_and_frame() -> None:
         num_frames=12,
         playing=False,
     ) == "Paused | walk | frame 5/12"
+
+
+def test_mesh_color_override_uses_transparency_only_when_requested() -> None:
+    viewer = object.__new__(KinematicTrajectoryViewer)
+    viewer.robot_opacity = 1.0
+    assert viewer._mesh_color_override() is None
+
+    viewer.robot_opacity = 0.35
+    assert viewer._mesh_color_override() == (190, 198, 208, 0.35)

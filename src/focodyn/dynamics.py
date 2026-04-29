@@ -352,6 +352,115 @@ class FloatingBaseDynamics(torch.nn.Module):
             return drift.squeeze(0), control_matrix.squeeze(0)
         return drift, control_matrix
 
+    def generalized_forces_from_acceleration(
+        self,
+        x: torch.Tensor,
+        generalized_acceleration: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return generalized forces for a desired generalized acceleration.
+
+        This evaluates ``M(q) nu_dot + h(q, nu)`` using the same Adam terms as
+        :meth:`f`. The first six entries are the floating-base generalized
+        wrench in Adam's mixed representation. The remaining entries are
+        generalized joint forces in model joint order.
+
+        Args:
+            x: State tensor with shape ``(state_dim,)`` or
+                ``(batch, state_dim)``.
+            generalized_acceleration: Desired generalized acceleration
+                ``nu_dot`` with shape ``(nv,)`` or ``(batch, nv)``.
+
+        Returns:
+            Generalized force tensor with shape ``(nv,)`` or ``(batch, nv)``
+            matching the input batch convention.
+
+        Raises:
+            ValueError: If ``generalized_acceleration`` does not have trailing
+                dimension ``nv``.
+        """
+        split = self.split_state(x)
+        acceleration = generalized_acceleration.to(dtype=self.dtype, device=self.device)
+        if acceleration.shape[-1] != self.nv:
+            raise ValueError(f"Expected generalized acceleration dimension {self.nv}.")
+        if split.was_single and acceleration.ndim == 1:
+            acceleration = acceleration.unsqueeze(0)
+
+        base_transform = make_transform(split.base_position, split.base_quaternion_wxyz)
+        mass = self.kindyn.mass_matrix(base_transform, split.joint_positions)
+        bias = self._bias_force(base_transform, split)
+        if bias.ndim == 1:
+            bias = bias.unsqueeze(0)
+        generalized_force = torch.matmul(mass, acceleration.unsqueeze(-1)).squeeze(-1) + bias
+        return generalized_force.squeeze(0) if split.was_single else generalized_force
+
+    def generalized_input_matrix(
+        self,
+        x: torch.Tensor,
+        *,
+        contact_force_frame: Literal["world", "contact"] | None = None,
+    ) -> torch.Tensor:
+        """Return the generalized-force input matrix ``B(q)``.
+
+        ``B(q)`` is the matrix used internally by :meth:`g` before multiplying
+        by ``M(q)^{-1}``. Its first columns map joint torques through
+        ``S^T``. When contact forces are enabled, the remaining columns map
+        stacked contact forces through ``J_c(q)^T``.
+
+        Args:
+            x: State tensor with shape ``(state_dim,)`` or
+                ``(batch, state_dim)``.
+            contact_force_frame: Optional override for contact-force input
+                coordinates. If ``None``, ``self.contact_force_frame`` is used.
+
+        Returns:
+            Generalized-force input matrix with shape ``(nv, input_dim)`` or
+            ``(batch, nv, input_dim)``.
+        """
+        split = self.split_state(x)
+        base_transform = make_transform(split.base_position, split.base_quaternion_wxyz)
+        generalized_input = self._generalized_input_matrix(
+            base_transform,
+            split.joint_positions,
+            contact_force_frame=contact_force_frame,
+        )
+        return generalized_input.squeeze(0) if split.was_single else generalized_input
+
+    def generalized_forces_from_input(
+        self,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        *,
+        contact_force_frame: Literal["world", "contact"] | None = None,
+    ) -> torch.Tensor:
+        """Project inputs into generalized forces.
+
+        Args:
+            x: State tensor with shape ``(state_dim,)`` or
+                ``(batch, state_dim)``.
+            u: Input tensor with shape ``(input_dim,)`` or
+                ``(batch, input_dim)``.
+            contact_force_frame: Optional override for contact-force input
+                coordinates.
+
+        Returns:
+            Generalized forces with shape ``(nv,)`` or ``(batch, nv)``.
+
+        Raises:
+            ValueError: If ``u`` does not have trailing dimension
+                ``input_dim``.
+        """
+        split = self.split_state(x)
+        inputs = u.to(dtype=self.dtype, device=self.device)
+        if inputs.shape[-1] != self.input_dim:
+            raise ValueError(f"Expected input dimension {self.input_dim}.")
+        if split.was_single and inputs.ndim == 1:
+            inputs = inputs.unsqueeze(0)
+        matrix = self.generalized_input_matrix(x, contact_force_frame=contact_force_frame)
+        if matrix.ndim == 2:
+            matrix = matrix.unsqueeze(0)
+        generalized_force = torch.matmul(matrix, inputs.unsqueeze(-1)).squeeze(-1)
+        return generalized_force.squeeze(0) if split.was_single else generalized_force
+
     def forward(self, x: torch.Tensor, u: torch.Tensor | None = None) -> torch.Tensor:
         """Evaluate the control-affine dynamics.
 
@@ -468,7 +577,11 @@ class FloatingBaseDynamics(torch.nn.Module):
         ) + self.kindyn.gravity_term(base_transform, split.joint_positions)
 
     def _generalized_input_matrix(
-        self, base_transform: torch.Tensor, joint_positions: torch.Tensor
+        self,
+        base_transform: torch.Tensor,
+        joint_positions: torch.Tensor,
+        *,
+        contact_force_frame: Literal["world", "contact"] | None = None,
     ) -> torch.Tensor:
         """Build the generalized-force input matrix before mass inversion.
 
@@ -492,7 +605,7 @@ class FloatingBaseDynamics(torch.nn.Module):
         force_transform = self.contact_model.contact_force_transform(
             base_transform,
             joint_positions,
-            force_frame=self.contact_force_frame,
+            force_frame=contact_force_frame or self.contact_force_frame,
         )
         contact_map = torch.matmul(contact_jacobian.transpose(-1, -2), force_transform)
         return torch.cat((torque_map, contact_map), dim=-1)

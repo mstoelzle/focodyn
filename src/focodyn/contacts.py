@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 from typing import NamedTuple
 
 import numpy as np
@@ -44,6 +45,302 @@ class ContactPoses(NamedTuple):
     positions: torch.Tensor
     quaternions_wxyz: torch.Tensor
     transforms: torch.Tensor
+
+
+class TerrainContactState(NamedTuple):
+    """Contact candidate state relative to a terrain model.
+
+    Attributes:
+        positions: World-frame contact candidate positions with shape
+            ``(..., num_contacts, 3)``.
+        nearest_points: World-frame nearest terrain points with shape
+            ``(..., num_contacts, 3)``.
+        signed_distances: Signed distances along the terrain normal with shape
+            ``(..., num_contacts)``. Positive values are above the terrain and
+            negative values indicate penetration.
+        penetration_depths: Non-negative penetration depths with shape
+            ``(..., num_contacts)``.
+        normals: World-frame terrain normals at the nearest points with shape
+            ``(..., num_contacts, 3)``.
+        in_contact: Boolean contact indicators with shape
+            ``(..., num_contacts)``.
+    """
+
+    positions: torch.Tensor
+    nearest_points: torch.Tensor
+    signed_distances: torch.Tensor
+    penetration_depths: torch.Tensor
+    normals: torch.Tensor
+    in_contact: torch.Tensor
+
+
+class ResolvedContactForces(NamedTuple):
+    """Contact force estimate returned by a contact resolver.
+
+    Attributes:
+        forces: Stacked 3D contact forces in ``force_frame`` with shape
+            ``(..., num_contacts, 3)``.
+        world_forces: The same forces expressed in the world frame with shape
+            ``(..., num_contacts, 3)``.
+        normal_forces: Scalar normal force magnitudes with shape
+            ``(..., num_contacts)``.
+        force_frame: Coordinate frame used by ``forces``.
+        active: Boolean active-contact mask with shape ``(..., num_contacts)``.
+    """
+
+    forces: torch.Tensor
+    world_forces: torch.Tensor
+    normal_forces: torch.Tensor
+    force_frame: Literal["world", "contact"]
+    active: torch.Tensor
+
+
+class FlatTerrainContactDetector(torch.nn.Module):
+    """Detect contact candidates against a flat terrain plane.
+
+    The current terrain model is the plane ``normal.dot(x) = height``. The
+    default is the common ``z = 0`` ground plane with upward normal
+    ``(0, 0, 1)``. The public output is intentionally independent of this
+    implementation detail so a mesh-backed detector can provide the same
+    quantities later.
+    """
+
+    def __init__(
+        self,
+        *,
+        height: float = 0.0,
+        normal: tuple[float, float, float] = (0.0, 0.0, 1.0),
+        contact_threshold: float = 0.02,
+        dtype: torch.dtype = torch.float64,
+        device: torch.device | str | None = None,
+    ) -> None:
+        """Initialize the flat-terrain contact detector.
+
+        Args:
+            height: Plane offset measured along ``normal`` in meters.
+            normal: Upward terrain normal in world coordinates.
+            contact_threshold: Maximum positive signed distance considered
+                contact, in meters.
+            dtype: Torch dtype used for detector buffers.
+            device: Torch device used for detector buffers. ``None`` selects
+                CPU.
+
+        Returns:
+            None.
+        """
+        super().__init__()
+        self.height = float(height)
+        self.contact_threshold = float(contact_threshold)
+        self.dtype = dtype
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        normal_tensor = torch.as_tensor(normal, dtype=dtype, device=self.device)
+        normal_norm = torch.linalg.norm(normal_tensor)
+        if normal_norm <= 0:
+            raise ValueError("Terrain normal must be non-zero.")
+        self.register_buffer("normal", normal_tensor / normal_norm, persistent=False)
+
+    def forward(self, contact_positions: torch.Tensor) -> TerrainContactState:
+        """Evaluate terrain contact state for contact candidate positions.
+
+        Args:
+            contact_positions: World-frame contact positions with shape
+                ``(..., num_contacts, 3)``.
+
+        Returns:
+            :class:`TerrainContactState` with one entry per contact candidate.
+
+        Raises:
+            ValueError: If the last dimension of ``contact_positions`` is not
+                three.
+        """
+        return self.detect(contact_positions)
+
+    def detect(self, contact_positions: torch.Tensor) -> TerrainContactState:
+        """Evaluate terrain contact state for contact candidate positions.
+
+        Args:
+            contact_positions: World-frame contact positions with shape
+                ``(..., num_contacts, 3)``.
+
+        Returns:
+            :class:`TerrainContactState`.
+
+        Raises:
+            ValueError: If the last dimension of ``contact_positions`` is not
+                three.
+        """
+        positions = contact_positions.to(dtype=self.dtype, device=self.device)
+        if positions.shape[-1] != 3:
+            raise ValueError("Contact positions must have last dimension 3.")
+
+        normal = self.normal.to(dtype=positions.dtype, device=positions.device)
+        signed_distances = torch.sum(positions * normal, dim=-1) - self.height
+        nearest_points = positions - signed_distances.unsqueeze(-1) * normal
+        penetration_depths = torch.clamp(-signed_distances, min=0.0)
+        normals = normal.expand_as(positions)
+        in_contact = signed_distances <= self.contact_threshold
+        return TerrainContactState(
+            positions=positions,
+            nearest_points=nearest_points,
+            signed_distances=signed_distances,
+            penetration_depths=penetration_depths,
+            normals=normals,
+            in_contact=in_contact,
+        )
+
+
+class BasicContactForceResolver(torch.nn.Module):
+    """Estimate normal contact forces for detected flat-terrain contacts.
+
+    The resolver combines a simple penalty normal force with an optional total
+    normal support force distributed over active contacts. It is deliberately
+    basic: it provides deterministic, inspectable contact forces for
+    visualization and debugging, not a full complementarity solver.
+    """
+
+    def __init__(
+        self,
+        *,
+        force_frame: Literal["world", "contact"] = "world",
+        normal_stiffness: float = 15_000.0,
+        normal_damping: float = 150.0,
+        tangential_damping: float = 0.0,
+        friction_coefficient: float = 0.8,
+    ) -> None:
+        """Initialize the contact-force resolver.
+
+        Args:
+            force_frame: Coordinate frame for the returned ``forces`` tensor.
+                The default is ``"world"``.
+            normal_stiffness: Penalty stiffness in N/m applied to penetration.
+            normal_damping: Damping in N/(m/s) applied to closing normal
+                velocity.
+            tangential_damping: Optional viscous tangential damping in
+                N/(m/s), friction-limited by ``friction_coefficient``.
+            friction_coefficient: Coulomb limit used for tangential damping.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If ``force_frame`` is not ``"world"`` or
+                ``"contact"``.
+        """
+        super().__init__()
+        if force_frame not in {"world", "contact"}:
+            raise ValueError("force_frame must be 'world' or 'contact'.")
+        self.force_frame = force_frame
+        self.normal_stiffness = float(normal_stiffness)
+        self.normal_damping = float(normal_damping)
+        self.tangential_damping = float(tangential_damping)
+        self.friction_coefficient = float(friction_coefficient)
+
+    def forward(
+        self,
+        contact_state: TerrainContactState,
+        *,
+        contact_velocities: torch.Tensor | None = None,
+        total_normal_force: torch.Tensor | float | None = None,
+        contact_poses: ContactPoses | None = None,
+    ) -> ResolvedContactForces:
+        """Resolve contact forces for a terrain contact state.
+
+        Args:
+            contact_state: Terrain contact state returned by a detector.
+            contact_velocities: Optional world-frame contact velocities with
+                shape ``(..., num_contacts, 3)``.
+            total_normal_force: Optional non-negative normal force budget
+                distributed over active contacts. Shape must broadcast to
+                ``contact_state.in_contact.shape[:-1]``.
+            contact_poses: Contact poses required when ``force_frame`` is
+                ``"contact"``.
+
+        Returns:
+            :class:`ResolvedContactForces`.
+
+        Raises:
+            ValueError: If contact-frame output is requested without
+                ``contact_poses``.
+        """
+        return self.resolve(
+            contact_state,
+            contact_velocities=contact_velocities,
+            total_normal_force=total_normal_force,
+            contact_poses=contact_poses,
+        )
+
+    def resolve(
+        self,
+        contact_state: TerrainContactState,
+        *,
+        contact_velocities: torch.Tensor | None = None,
+        total_normal_force: torch.Tensor | float | None = None,
+        contact_poses: ContactPoses | None = None,
+    ) -> ResolvedContactForces:
+        """Resolve contact forces for a terrain contact state.
+
+        Args:
+            contact_state: Terrain contact state returned by a detector.
+            contact_velocities: Optional world-frame contact velocities with
+                shape ``(..., num_contacts, 3)``.
+            total_normal_force: Optional non-negative normal force budget
+                distributed over active contacts.
+            contact_poses: Contact poses required for contact-frame output.
+
+        Returns:
+            :class:`ResolvedContactForces`.
+        """
+        positions = contact_state.positions
+        normals = contact_state.normals.to(dtype=positions.dtype, device=positions.device)
+        active = contact_state.in_contact
+        active_float = active.to(dtype=positions.dtype)
+
+        normal_force = self.normal_stiffness * contact_state.penetration_depths
+        if contact_velocities is not None:
+            velocities = contact_velocities.to(dtype=positions.dtype, device=positions.device)
+            normal_velocity = torch.sum(velocities * normals, dim=-1)
+            normal_force = normal_force + self.normal_damping * torch.clamp(-normal_velocity, min=0.0)
+
+        normal_force = torch.clamp(normal_force, min=0.0) * active_float
+        if total_normal_force is not None:
+            total = torch.as_tensor(total_normal_force, dtype=positions.dtype, device=positions.device)
+            while total.ndim < active.ndim - 1:
+                total = total.unsqueeze(-1)
+            active_count = torch.clamp(active_float.sum(dim=-1), min=1.0)
+            support_force = torch.clamp(total, min=0.0) / active_count
+            normal_force = normal_force + support_force.unsqueeze(-1) * active_float
+
+        world_forces = normal_force.unsqueeze(-1) * normals
+        if contact_velocities is not None and self.tangential_damping > 0.0:
+            velocities = contact_velocities.to(dtype=positions.dtype, device=positions.device)
+            normal_velocity = torch.sum(velocities * normals, dim=-1, keepdim=True) * normals
+            tangential_velocity = velocities - normal_velocity
+            tangential_force = -self.tangential_damping * tangential_velocity
+            tangential_norm = torch.linalg.norm(tangential_force, dim=-1, keepdim=True)
+            max_tangential = self.friction_coefficient * normal_force.unsqueeze(-1)
+            scale = torch.minimum(
+                torch.ones_like(tangential_norm),
+                max_tangential / torch.clamp(tangential_norm, min=1e-12),
+            )
+            world_forces = world_forces + tangential_force * scale * active_float.unsqueeze(-1)
+
+        if self.force_frame == "world":
+            forces = world_forces
+        else:
+            if contact_poses is None:
+                raise ValueError("contact_poses are required for contact-frame force output.")
+            rotations = contact_poses.transforms[..., :3, :3].to(
+                dtype=positions.dtype, device=positions.device
+            )
+            forces = torch.matmul(rotations.transpose(-1, -2), world_forces.unsqueeze(-1)).squeeze(-1)
+
+        return ResolvedContactForces(
+            forces=forces,
+            world_forces=world_forces,
+            normal_forces=normal_force,
+            force_frame=self.force_frame,
+            active=active,
+        )
 
 
 class FloatingBaseContactModel(torch.nn.Module):

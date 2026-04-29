@@ -64,6 +64,29 @@ def test_forward_matches_control_affine_formula(model: FloatingBaseDynamics) -> 
     assert torch.allclose(model(x, u), expected)
 
 
+def test_generalized_forces_from_acceleration_matches_drift_equation(
+    model: FloatingBaseDynamics,
+) -> None:
+    x = model.neutral_state()
+    drift = model.f(x)
+    generalized_force = model.generalized_forces_from_acceleration(x, drift[model.nq :])
+    assert generalized_force.shape == (model.nv,)
+    assert torch.allclose(generalized_force, torch.zeros_like(generalized_force), atol=1e-9)
+
+
+def test_generalized_forces_from_input_projects_joint_torques(model: FloatingBaseDynamics) -> None:
+    x = model.neutral_state()
+    u = torch.zeros(model.input_dim, dtype=model.dtype)
+    joint_torques = torch.linspace(-1.0, 1.0, model.n_joints, dtype=model.dtype)
+    u[: model.n_joints] = joint_torques
+
+    generalized_force = model.generalized_forces_from_input(x, u)
+
+    assert generalized_force.shape == (model.nv,)
+    assert torch.allclose(generalized_force[:6], torch.zeros(6, dtype=model.dtype))
+    assert torch.allclose(generalized_force[6:], joint_torques)
+
+
 def test_forward_with_control_uses_fused_mass_matrix(
     model: FloatingBaseDynamics, monkeypatch: pytest.MonkeyPatch
 ) -> None:

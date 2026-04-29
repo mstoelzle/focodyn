@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from focodyn import FloatingBaseDynamics
+from focodyn.contacts import BasicContactForceResolver, ContactPoses, FlatTerrainContactDetector
 
 
 @pytest.fixture(scope="module")
@@ -131,3 +132,65 @@ def test_contact_frame_force_mapping_is_supported() -> None:
     control = model.g(x)
     assert control.shape == (model.state_dim, model.input_dim)
     assert torch.isfinite(control).all()
+
+
+def test_flat_terrain_contact_detector_reports_distances() -> None:
+    detector = FlatTerrainContactDetector(contact_threshold=0.025, dtype=torch.float64)
+    positions = torch.tensor(
+        [
+            [0.0, 0.0, 0.03],
+            [1.0, 0.0, -0.02],
+        ],
+        dtype=torch.float64,
+    )
+
+    state = detector.detect(positions)
+
+    assert torch.allclose(state.signed_distances, torch.tensor([0.03, -0.02], dtype=torch.float64))
+    assert torch.allclose(state.penetration_depths, torch.tensor([0.0, 0.02], dtype=torch.float64))
+    assert torch.allclose(state.nearest_points[:, 2], torch.zeros(2, dtype=torch.float64))
+    assert torch.equal(state.in_contact, torch.tensor([False, True]))
+    assert torch.allclose(state.normals, torch.tensor([[0.0, 0.0, 1.0]] * 2, dtype=torch.float64))
+
+
+def test_basic_contact_force_resolver_support_force_and_frames() -> None:
+    detector = FlatTerrainContactDetector(contact_threshold=0.025, dtype=torch.float64)
+    positions = torch.tensor(
+        [
+            [0.0, 0.0, -0.01],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=torch.float64,
+    )
+    contact_state = detector.detect(positions)
+    resolver = BasicContactForceResolver(
+        force_frame="world",
+        normal_stiffness=1000.0,
+        normal_damping=0.0,
+    )
+
+    resolved = resolver.resolve(contact_state, total_normal_force=torch.tensor(20.0))
+
+    assert resolved.force_frame == "world"
+    assert torch.allclose(resolved.normal_forces, torch.tensor([20.0, 10.0], dtype=torch.float64))
+    assert torch.allclose(resolved.world_forces[:, :2], torch.zeros(2, 2, dtype=torch.float64))
+    assert torch.allclose(resolved.world_forces[:, 2], resolved.normal_forces)
+
+    transforms = torch.eye(4, dtype=torch.float64).repeat(2, 1, 1)
+    poses = ContactPoses(
+        positions=positions,
+        quaternions_wxyz=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2, dtype=torch.float64),
+        transforms=transforms,
+    )
+    contact_resolver = BasicContactForceResolver(force_frame="contact", normal_stiffness=1000.0)
+    contact_forces = contact_resolver.resolve(contact_state, total_normal_force=20.0, contact_poses=poses)
+    assert contact_forces.force_frame == "contact"
+    assert torch.allclose(contact_forces.forces, contact_forces.world_forces)
+
+
+def test_contact_frame_force_resolver_requires_contact_poses() -> None:
+    detector = FlatTerrainContactDetector(dtype=torch.float64)
+    contact_state = detector.detect(torch.zeros(1, 3, dtype=torch.float64))
+    resolver = BasicContactForceResolver(force_frame="contact")
+    with pytest.raises(ValueError, match="contact_poses"):
+        resolver.resolve(contact_state)

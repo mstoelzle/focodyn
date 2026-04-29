@@ -121,6 +121,24 @@ stacked world-frame contact point velocities. The contact force contribution to
 the equations of motion is `J_c(q)^T lambda` for world-frame forces, or
 `J_c(q)^T R_WC lambda_C` for contact-frame forces.
 
+`FlatTerrainContactDetector` evaluates each configured contact candidate
+against a flat terrain plane and returns nearest terrain points, signed
+distances, penetration depths, world normals, and binary contact flags.
+`BasicContactForceResolver` provides a deterministic normal-force estimate for
+debugging and visualization. It returns forces in the world frame by default,
+or in each local contact frame with `force_frame="contact"`.
+
+## Motion Derivatives
+
+Kinematic references can be differentiated with `torch-dxdt` Whittaker-Eilers
+filters to estimate `nu` and `nu_dot` for inverse-dynamics inspection. To
+compare smoothing parameters and save a plot of raw/smoothed motion,
+velocities, and accelerations:
+
+```bash
+uv run --extra viz focodyn-plot-motion-derivatives --lambdas 10 100 1000 10000 --output motion_derivative_lambdas.png
+```
+
 ## Visualization
 
 Start the Viser viewer with:
@@ -142,6 +160,22 @@ dropdown for switching between bundled kinematic references.
 Pass `--synthetic-motion` to recover the older deterministic fallback sequence,
 or `--motion-reference /path/to/file.npz` / `--motion-reference /path/to/file.npy`
 to visualize another supported retargeted G1 motion.
+
+For inspecting the dynamics maps, use the specialized viewer:
+
+```bash
+uv run --extra viz focodyn-visualize-dynamics --whittaker-lambda 100
+```
+
+The dynamics viewer inherits the kinematic trajectory viewer and adds two
+modes. `f(x): inverse dynamics` ignores contacts and visualizes the virtual
+root wrench plus the largest joint torques from `M(q) nu_dot + h(q,nu)`.
+`g(x): contact projection` resolves flat-ground contact forces, projects them
+through the contact-force input block, and visualizes the resulting root wrench,
+joint torques, and contact force vectors. The dynamics viewer renders the robot
+semi-transparently by default and includes a `Joint torque viz` selector for
+showing torque arrows, text labels, or both. Override the transparency with
+`--robot-opacity 0.5` when needed.
 
 ## Sources And Attribution
 
@@ -180,4 +214,5 @@ original upstream URDFs remain vendored unchanged and are used for source
 inspection and visualization.
 
 The visualization uses [Viser](https://viser.studio/) when the optional
-`viz` extra is installed.
+`viz` extra is installed. Whittaker-Eilers derivatives use
+[torch-dxdt](https://github.com/mstoelzle/torch-dxdt).
