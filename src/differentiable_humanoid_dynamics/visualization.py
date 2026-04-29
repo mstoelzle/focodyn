@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
+import sys
 import time
 
 import numpy as np
@@ -17,6 +20,7 @@ def run_contact_viewer(
     fps: float = 30.0,
     port: int = 8080,
     load_meshes: bool = True,
+    max_frames: int | None = None,
 ) -> None:
     """Run a Viser URDF viewer with Adam FK contact points overlaid."""
     try:
@@ -40,7 +44,7 @@ def run_contact_viewer(
     robot_root = server.scene.add_frame("/robot", show_axes=False)
     urdf_vis = ViserUrdf(
         server,
-        urdf_or_path=str(model.asset.urdf_path),
+        urdf_or_path=Path(model.asset.urdf_path),
         root_node_name="/robot",
         load_meshes=load_meshes,
         load_collision_meshes=False,
@@ -64,6 +68,7 @@ def run_contact_viewer(
     ]
 
     frame = 0
+    frames_rendered = 0
     period = 1.0 / fps
     while True:
         state = states[frame]
@@ -103,6 +108,11 @@ def run_contact_viewer(
             frame_handle.wxyz = tuple(float(value) for value in quat)
 
         frame = (frame + 1) % len(states)
+        frames_rendered += 1
+        if max_frames is not None and frames_rendered >= max_frames:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         time.sleep(period)
 
 
@@ -113,6 +123,7 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--no-meshes", action="store_true")
+    parser.add_argument("--max-frames", type=int, default=None)
     args = parser.parse_args()
     run_contact_viewer(
         asset_name=args.asset,
@@ -120,4 +131,5 @@ def main() -> None:
         fps=args.fps,
         port=args.port,
         load_meshes=not args.no_meshes,
+        max_frames=args.max_frames,
     )
