@@ -29,10 +29,6 @@ from .motion_derivatives import (
 )
 from .walking import simple_walking_sequence
 
-HumanoidAsset = RobotAsset
-HumanoidContactModel = FloatingBaseContactModel
-HumanoidDynamics = FloatingBaseDynamics
-
 __all__ = [
     "DynamicsTerms",
     "AffineConstraintTerms",
@@ -43,13 +39,10 @@ __all__ = [
     "PositiveNormalContactForces",
     "LinearizedFrictionCone",
     "RobotAsset",
-    "HumanoidAsset",
     "FloatingBaseContactModel",
-    "HumanoidContactModel",
     "FlatTerrainContactDetector",
     "BasicContactForceResolver",
     "FloatingBaseDynamics",
-    "HumanoidDynamics",
     "KinematicMotionReference",
     "MotionDerivativeEstimate",
     "ContactPoses",

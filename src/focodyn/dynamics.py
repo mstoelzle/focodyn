@@ -655,6 +655,3 @@ def _build_adam_kindyn(asset: RobotAsset, dtype: torch.dtype, device: torch.devi
         )
     kindyn.set_frame_velocity_representation(adam.Representations.MIXED_REPRESENTATION)
     return kindyn
-
-
-HumanoidDynamics = FloatingBaseDynamics

@@ -874,6 +874,3 @@ def _block_diag_rotations(rotations: torch.Tensor) -> torch.Tensor:
         3 * num_contacts,
         3 * num_contacts,
     )
-
-
-HumanoidContactModel = FloatingBaseContactModel

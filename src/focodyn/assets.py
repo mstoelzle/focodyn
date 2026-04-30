@@ -122,6 +122,3 @@ def _adam_compatible_path(urdf_path: Path) -> Path:
     """
     candidate = urdf_path.with_name(f"{urdf_path.stem}.adam.urdf")
     return candidate if candidate.exists() else urdf_path
-
-
-HumanoidAsset = RobotAsset
