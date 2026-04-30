@@ -10,7 +10,7 @@ backend. Adam provides the floating-base mass matrix, Coriolis/centrifugal
 terms, gravity terms, Jacobians, and forward kinematics. This repository adds a
 legged-robot layer around those quantities:
 
-- an installable Python package with `uv` and Python 3.12,
+- an installable Python package with `uv` and Python >=3.11,
 - vendored Unitree G1 URDF/MJCF assets to start,
 - a shared `torch.nn.Module` exposing control-affine `f(x)` and `g(x)`,
 - differentiable foot contact-pose forward kinematics and Jacobians, and
