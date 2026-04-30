@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import math
+import builtins
+
+import pytest
 import torch
 
 from focodyn import (
@@ -11,6 +15,8 @@ from focodyn import (
     simple_walking_sequence,
 )
 from focodyn.motion import EMBER_G1_MOTION_REFERENCE
+from focodyn.rotations import matrix_to_quaternion_wxyz, unwrap_angles
+from focodyn.motion_derivatives import _order_value, _require_torch_dxdt
 
 
 def test_bundled_g1_motion_reference_loads() -> None:
@@ -68,9 +74,57 @@ def test_bundled_g1_motion_contact_heights_are_grounded() -> None:
     assert torch.mean(normals[stance, 2]) > 0.9
 
 
-def test_whittaker_motion_derivative_estimate_shapes() -> None:
+def test_joint_angle_unwrap_removes_periodic_discontinuity() -> None:
+    angles = torch.tensor(
+        [
+            [3.00, -0.1],
+            [3.10, -0.2],
+            [-3.10, -0.3],
+            [-3.00, -0.4],
+        ],
+        dtype=torch.float64,
+    )
+
+    unwrapped = unwrap_angles(angles)
+
+    assert torch.max(torch.abs(torch.diff(unwrapped[:, 0]))) < 0.2
+    assert torch.allclose(unwrapped[:, 1], angles[:, 1])
+    assert unwrapped[-1, 0] > math.pi
+
+
+def test_whittaker_orientation_derivative_estimates_world_angular_velocity() -> None:
     import pytest
 
+    pytest.importorskip("torch_dxdt")
+    model = FloatingBaseDynamics("unitree_g1", dtype=torch.float64)
+    frames = 60
+    dt = 1.0 / 60.0
+    yaw_rate = 1.25
+    times = torch.arange(frames, dtype=model.dtype) * dt
+    yaw = yaw_rate * times
+    cos_yaw = torch.cos(yaw)
+    sin_yaw = torch.sin(yaw)
+    rotations = torch.zeros(frames, 3, 3, dtype=model.dtype)
+    rotations[:, 0, 0] = cos_yaw
+    rotations[:, 0, 1] = -sin_yaw
+    rotations[:, 1, 0] = sin_yaw
+    rotations[:, 1, 1] = cos_yaw
+    rotations[:, 2, 2] = 1.0
+
+    states = torch.zeros(frames, model.state_dim, dtype=model.dtype)
+    states[:, 3:7] = matrix_to_quaternion_wxyz(rotations)
+
+    estimate = estimate_motion_derivatives(model, states, times, lmbda=1.0)
+    angular_velocity = estimate.configuration_velocities[10:-10, 3:6]
+
+    assert torch.allclose(
+        angular_velocity.mean(dim=0),
+        torch.tensor([0.0, 0.0, yaw_rate], dtype=model.dtype),
+        atol=1e-3,
+    )
+
+
+def test_whittaker_motion_derivative_estimate_shapes() -> None:
     pytest.importorskip("torch_dxdt")
     model = FloatingBaseDynamics("unitree_g1", dtype=torch.float64)
     states, times = simple_walking_sequence(model, frames=24, dt=1.0 / 60.0)
@@ -80,6 +134,10 @@ def test_whittaker_motion_derivative_estimate_shapes() -> None:
     assert estimate.states.shape == states.shape
     assert estimate.generalized_accelerations.shape == (states.shape[0], model.nv)
     assert estimate.configurations.shape == (states.shape[0], model.nq)
+    assert estimate.configuration_velocities.shape == (states.shape[0], model.nv)
+    assert estimate.configuration_accelerations.shape == (states.shape[0], model.nv)
+    assert torch.allclose(estimate.configuration_velocities, estimate.states[:, model.nq :])
+    assert torch.allclose(estimate.configuration_accelerations, estimate.generalized_accelerations)
     assert torch.isfinite(estimate.states).all()
     assert torch.isfinite(estimate.generalized_accelerations).all()
     assert torch.allclose(
@@ -87,3 +145,32 @@ def test_whittaker_motion_derivative_estimate_shapes() -> None:
         torch.ones(states.shape[0], dtype=model.dtype),
         atol=1e-7,
     )
+
+
+def test_motion_derivative_estimator_rejects_invalid_shapes() -> None:
+    pytest.importorskip("torch_dxdt")
+    model = FloatingBaseDynamics("unitree_g1", dtype=torch.float64)
+    states, times = simple_walking_sequence(model, frames=5, dt=1.0 / 60.0)
+
+    with pytest.raises(ValueError, match="Expected states"):
+        estimate_motion_derivatives(model, states[:, :-1], times)
+    with pytest.raises(ValueError, match="times"):
+        estimate_motion_derivatives(model, states, times[:-1])
+    with pytest.raises(ValueError, match="At least four"):
+        estimate_motion_derivatives(model, states[:3], times[:3])
+
+
+def test_motion_derivative_private_dependency_and_order_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_import = builtins.__import__
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "torch_dxdt":
+            raise ImportError("blocked")
+        return real_import(name, globals, locals, fromlist, level)
+
+    values = [torch.tensor([0.0]), torch.tensor([1.0])]
+
+    assert torch.equal(_order_value(values, 1), torch.tensor([1.0]))
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    with pytest.raises(ImportError, match="torch-dxdt"):
+        _require_torch_dxdt()

@@ -4,10 +4,12 @@ import pytest
 import torch
 
 from focodyn import (
+    AffineInputConstraint,
     InputConstraintSet,
     JointTorqueLimits,
     LinearizedFrictionCone,
     PositiveNormalContactForces,
+    StaticAffineInputConstraint,
 )
 
 
@@ -48,6 +50,17 @@ def test_joint_torque_limits_accept_scalar_bounds_with_joint_count() -> None:
     assert constraint.input_dim == 5
     assert constraint.n_joints == 3
     assert bool(constraint.is_satisfied(u))
+
+
+def test_joint_torque_limits_infer_default_input_dimension_from_vector_bounds() -> None:
+    constraint = JointTorqueLimits(
+        torch.tensor([-1.0, -2.0], dtype=torch.float64),
+        torch.tensor([1.0, 2.0], dtype=torch.float64),
+        dtype=torch.float64,
+    )
+
+    assert constraint.input_dim == 2
+    assert bool(constraint.is_satisfied(torch.zeros(2, dtype=torch.float64)))
 
 
 def test_positive_normal_contact_forces_use_local_normal_components() -> None:
@@ -188,3 +201,78 @@ def test_input_constraint_set_rejects_mismatched_input_dimensions() -> None:
 
     with pytest.raises(ValueError, match="same input_dim"):
         InputConstraintSet(first, second)
+
+
+def test_affine_constraint_base_and_static_validation_branches() -> None:
+    with pytest.raises(ValueError, match="input_dim"):
+        AffineInputConstraint(0)
+    with pytest.raises(NotImplementedError):
+        AffineInputConstraint(1).affine_terms()
+    with pytest.raises(ValueError, match="matrix"):
+        StaticAffineInputConstraint(torch.zeros(2), torch.zeros(2))
+    with pytest.raises(ValueError, match="upper_bound"):
+        StaticAffineInputConstraint(torch.zeros(2, 2), torch.zeros(2, 1))
+    with pytest.raises(ValueError, match="same number"):
+        StaticAffineInputConstraint(torch.zeros(2, 2), torch.zeros(1))
+
+    constraint = StaticAffineInputConstraint(torch.eye(2, dtype=torch.float64), torch.ones(2, dtype=torch.float64))
+    composed = constraint.compose(constraint)
+
+    assert isinstance(composed, InputConstraintSet)
+    with pytest.raises(ValueError, match="Expected input dimension"):
+        constraint(torch.zeros(3, dtype=torch.float64))
+    with pytest.raises(ValueError, match="At least one"):
+        InputConstraintSet()
+
+
+def test_input_constraint_constructors_reject_invalid_limits_and_blocks() -> None:
+    with pytest.raises(ValueError, match="less than or equal"):
+        JointTorqueLimits(2.0, 1.0, n_joints=1)
+    with pytest.raises(ValueError, match="length must be positive"):
+        JointTorqueLimits(-1.0, 1.0, n_joints=0)
+    with pytest.raises(ValueError, match="scalar or one-dimensional"):
+        JointTorqueLimits(torch.ones(1, 1), torch.ones(1, 1))
+    with pytest.raises(ValueError, match="matching lengths"):
+        JointTorqueLimits(torch.ones(2), torch.ones(3))
+    with pytest.raises(ValueError, match="length must be positive"):
+        JointTorqueLimits(torch.empty(0), torch.empty(0))
+    with pytest.raises(ValueError, match="n_values is required"):
+        JointTorqueLimits(-1.0, 1.0)
+    with pytest.raises(ValueError, match="at least"):
+        JointTorqueLimits(-1.0, 1.0, n_joints=2, input_dim=1)
+    with pytest.raises(ValueError, match="start"):
+        JointTorqueLimits(-1.0, 1.0, n_joints=1, input_dim=2, torque_start=-1)
+
+    with pytest.raises(ValueError, match="input_dim"):
+        PositiveNormalContactForces(input_dim=0, num_contacts=0, contact_force_start=0)
+    with pytest.raises(ValueError, match="width"):
+        PositiveNormalContactForces(input_dim=3, num_contacts=0, contact_force_start=0)
+    with pytest.raises(ValueError, match="exceeds"):
+        PositiveNormalContactForces(input_dim=2, num_contacts=1, contact_force_start=0)
+    with pytest.raises(ValueError, match="normal_axis"):
+        PositiveNormalContactForces(input_dim=3, num_contacts=1, contact_force_start=0, normal_axis=3)
+    with pytest.raises(ValueError, match="length 1"):
+        PositiveNormalContactForces(
+            input_dim=3,
+            num_contacts=1,
+            contact_force_start=0,
+            minimum_normal_force=[1.0, 2.0],
+        )
+    with pytest.raises(ValueError, match="scalar or one-dimensional"):
+        PositiveNormalContactForces(
+            input_dim=3,
+            num_contacts=1,
+            contact_force_start=0,
+            minimum_normal_force=[[1.0]],
+        )
+
+
+def test_friction_cone_rejects_invalid_coefficients_axes_and_facets() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        LinearizedFrictionCone(-0.1, input_dim=3, num_contacts=1, contact_force_start=0)
+    with pytest.raises(ValueError, match="at least 3"):
+        LinearizedFrictionCone(0.5, input_dim=3, num_contacts=1, contact_force_start=0, num_facets=2)
+    with pytest.raises(ValueError, match="two axes"):
+        LinearizedFrictionCone(0.5, input_dim=3, num_contacts=1, contact_force_start=0, tangent_axes=(0,))
+    with pytest.raises(ValueError, match="permutation"):
+        LinearizedFrictionCone(0.5, input_dim=3, num_contacts=1, contact_force_start=0, tangent_axes=(0, 2))

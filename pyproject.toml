@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "coverage[toml]>=7.6",
     "pytest>=8.0",
 ]
 viz = [
@@ -26,7 +27,6 @@ viz = [
 
 [project.scripts]
 focodyn-check-adam-g1 = "focodyn.cli.check_adam_g1:main"
-focodyn-plot-motion-derivatives = "focodyn.motion_derivatives:main"
 focodyn-visualize-g1 = "focodyn.visualization:main"
 focodyn-visualize-dynamics = "focodyn.visualization:dynamics_main"
 focodyn-visualize-input-constraints = "focodyn.visualization:input_constraints_main"
@@ -34,3 +34,11 @@ focodyn-visualize-input-constraints = "focodyn.visualization:input_constraints_m
 [build-system]
 requires = ["uv_build>=0.11.8,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.coverage.run]
+branch = true
+source = ["focodyn"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

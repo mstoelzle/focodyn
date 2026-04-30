@@ -136,7 +136,7 @@ compare smoothing parameters and save a plot of raw/smoothed motion,
 velocities, and accelerations:
 
 ```bash
-uv run --extra viz focodyn-plot-motion-derivatives --lambdas 10 100 1000 10000 --output motion_derivative_lambdas.png
+uv run --extra viz python examples/plot_g1_motion_derivatives.py --lambdas 10 100 1000 10000 --output motion_derivative_lambdas.pdf
 ```
 
 ## Visualization

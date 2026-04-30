@@ -26,7 +26,6 @@ from .motion import (
 from .motion_derivatives import (
     MotionDerivativeEstimate,
     estimate_motion_derivatives,
-    plot_motion_derivative_lambdas,
 )
 from .walking import simple_walking_sequence
 
@@ -62,6 +61,5 @@ __all__ = [
     "estimate_motion_derivatives",
     "load_asset",
     "load_kinematic_motion_reference",
-    "plot_motion_derivative_lambdas",
     "simple_walking_sequence",
 ]

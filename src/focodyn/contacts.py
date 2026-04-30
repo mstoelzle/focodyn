@@ -7,8 +7,8 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from ._torch import matrix_to_quaternion_wxyz, rpy_to_matrix, skew
 from .assets import RobotAsset, load_asset
+from .rotations import matrix_to_quaternion_wxyz, rpy_to_matrix, skew
 
 
 @dataclass(frozen=True)

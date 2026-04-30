@@ -9,11 +9,13 @@ import torch
 from ._torch import (
     ensure_batch,
     make_transform,
-    normalize_quaternion_wxyz,
-    quaternion_derivative_from_world_angular_velocity,
 )
 from .assets import RobotAsset, load_asset
 from .contacts import FloatingBaseContactModel
+from .rotations import (
+    normalize_quaternion_wxyz,
+    quaternion_derivative_from_world_angular_velocity,
+)
 
 
 class SplitState(NamedTuple):
