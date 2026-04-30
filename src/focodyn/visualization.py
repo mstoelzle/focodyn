@@ -21,6 +21,11 @@ import torch
 
 from .contacts import BasicContactForceResolver, ContactPoses, FlatTerrainContactDetector
 from .dynamics import FloatingBaseDynamics, SplitState
+from .input_constraints import (
+    JointTorqueLimits,
+    LinearizedFrictionCone,
+    PositiveNormalContactForces,
+)
 from .motion import (
     EMBER_G1_MOTION_REFERENCE,
     bundled_motion_reference_path,
@@ -44,6 +49,23 @@ class _ViewerMotion:
     label: str
     states: torch.Tensor
     times: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _InputConstraintEvaluation:
+    """Per-frame input constraint quantities for visualization."""
+
+    generalized_force: torch.Tensor
+    joint_torques: torch.Tensor
+    contact_forces: torch.Tensor
+    world_contact_forces: torch.Tensor
+    joint_violation_magnitudes: torch.Tensor
+    joint_violation_signs: torch.Tensor
+    normal_force_violation: torch.Tensor
+    friction_violation: torch.Tensor
+    friction_violation_directions_world: torch.Tensor
+    active_contacts: torch.Tensor
+    total_normal_force: torch.Tensor
 
 
 class _FfmpegVideoWriter:
@@ -1136,6 +1158,505 @@ class DynamicsVerificationViewer(KinematicTrajectoryViewer):
         )
 
 
+class InputConstraintVerificationViewer(DynamicsVerificationViewer):
+    """Viser viewer for checking affine input-constraint violations."""
+
+    CONSERVATIVE_CONE = "conservative inner cone"
+    OUTER_CONE = "outer cone"
+
+    def __init__(
+        self,
+        *,
+        torque_limit_scale: float = 1.0,
+        friction_coefficient: float = 0.8,
+        friction_facets: int = 8,
+        friction_conservative: bool = True,
+        contact_tangential_damping: float = 50.0,
+        force_violation_scale: float = 0.002,
+        robot_opacity: float = 0.35,
+        **kwargs,
+    ) -> None:
+        """Initialize the input-constraint verification viewer.
+
+        Args:
+            torque_limit_scale: Scale applied to URDF effort limits before
+                building the joint-torque constraints.
+            friction_coefficient: Coulomb friction coefficient used for the
+                linearized friction cone and the rough tangential contact
+                force estimate.
+            friction_facets: Number of linearized friction cone facets.
+            friction_conservative: Whether the linearized cone uses the
+                conservative inner approximation.
+            contact_tangential_damping: Tangential damping used by the rough
+                contact-force resolver. Set to zero to estimate normal forces
+                only.
+            force_violation_scale: Meters of red contact violation arrow per
+                Newton.
+            robot_opacity: Visual mesh opacity.
+            **kwargs: Arguments forwarded to
+                :class:`DynamicsVerificationViewer`.
+
+        Returns:
+            None.
+        """
+        kwargs = dict(kwargs)
+        kwargs["contact_force_frame"] = "contact"
+        super().__init__(robot_opacity=robot_opacity, **kwargs)
+        self.torque_limit_scale = float(torque_limit_scale)
+        self.friction_coefficient = float(friction_coefficient)
+        self.friction_facets = int(friction_facets)
+        self.friction_conservative = bool(friction_conservative)
+        self.contact_tangential_damping = float(contact_tangential_damping)
+        self.force_scale = float(force_violation_scale)
+        self.joint_torque_scale = 0.01
+        self.joint_effort_limits = _joint_effort_limit_tensor(self.model)
+        self.contact_resolver = BasicContactForceResolver(
+            force_frame="contact",
+            tangential_damping=self.contact_tangential_damping,
+            friction_coefficient=self.friction_coefficient,
+        )
+        self.constraint_joint_violation_handles: list[Any] = []
+        self.constraint_joint_violation_tip_handles: list[Any] = []
+        self.constraint_joint_violation_labels: list[Any | None] = []
+        self.normal_force_violation_handles: list[Any] = []
+        self.normal_force_violation_tip_handles: list[Any] = []
+        self.friction_violation_handles: list[Any] = []
+        self.friction_violation_tip_handles: list[Any] = []
+        self.constraint_status_text: Any | None = None
+
+    def _setup_extra_scene(self) -> None:
+        """Create red violation arrows for joints and contacts."""
+        assert self.server is not None
+        red = (235, 55, 45)
+        dark_red = (190, 30, 40)
+        for index in range(self.top_joint_count):
+            self.constraint_joint_violation_handles.append(
+                self.server.scene.add_cylinder(
+                    f"/input_constraints/joint_violation/{index}",
+                    radius=0.012,
+                    height=1.0,
+                    color=red,
+                    visible=False,
+                )
+            )
+            self.constraint_joint_violation_tip_handles.append(
+                self.server.scene.add_icosphere(
+                    f"/input_constraints/joint_violation_tip/{index}",
+                    radius=0.024,
+                    color=red,
+                    visible=False,
+                )
+            )
+            self.constraint_joint_violation_labels.append(None)
+
+        assert self.model.contact_model is not None
+        for name in self.model.contact_model.contact_names:
+            safe_name = name.replace(":", "_")
+            self.normal_force_violation_handles.append(
+                self.server.scene.add_cylinder(
+                    f"/input_constraints/normal_violation/{safe_name}",
+                    radius=0.012,
+                    height=1.0,
+                    color=red,
+                    visible=False,
+                )
+            )
+            self.normal_force_violation_tip_handles.append(
+                self.server.scene.add_icosphere(
+                    f"/input_constraints/normal_violation_tip/{safe_name}",
+                    radius=0.024,
+                    color=red,
+                    visible=False,
+                )
+            )
+            self.friction_violation_handles.append(
+                self.server.scene.add_cylinder(
+                    f"/input_constraints/friction_violation/{safe_name}",
+                    radius=0.012,
+                    height=1.0,
+                    color=dark_red,
+                    visible=False,
+                )
+            )
+            self.friction_violation_tip_handles.append(
+                self.server.scene.add_icosphere(
+                    f"/input_constraints/friction_violation_tip/{safe_name}",
+                    radius=0.024,
+                    color=dark_red,
+                    visible=False,
+                )
+            )
+
+    def _setup_extra_gui(self) -> None:
+        """Create input-constraint verification controls."""
+        assert self.server is not None
+        with self.server.gui.add_folder("Input Constraint Verification", expand_by_default=True):
+            lambda_number = self.server.gui.add_number(
+                "Whittaker lambda",
+                self.whittaker_lmbda,
+                min=0.0,
+                step=10.0,
+                hint="Higher values smooth the motion derivatives more strongly.",
+            )
+            torque_limit_scale_number = self.server.gui.add_number(
+                "Torque limit scale",
+                self.torque_limit_scale,
+                min=0.0,
+                step=0.05,
+                hint="Scale applied to URDF effort limits.",
+            )
+            friction_number = self.server.gui.add_number(
+                "Friction coefficient",
+                self.friction_coefficient,
+                min=0.0,
+                step=0.05,
+                hint="Coulomb coefficient used by friction cone constraints.",
+            )
+            friction_facets_number = self.server.gui.add_number(
+                "Friction facets",
+                self.friction_facets,
+                min=3,
+                step=1,
+                hint="Number of linear facets per contact friction cone.",
+            )
+            cone_dropdown = self.server.gui.add_dropdown(
+                "Cone approximation",
+                (self.CONSERVATIVE_CONE, self.OUTER_CONE),
+                initial_value=self.CONSERVATIVE_CONE if self.friction_conservative else self.OUTER_CONE,
+                hint="Conservative mode keeps the polygon inside the circular Coulomb cone.",
+            )
+            tangential_damping_number = self.server.gui.add_number(
+                "Tangential damping",
+                self.contact_tangential_damping,
+                min=0.0,
+                step=10.0,
+                hint="Rough tangential contact-force estimate used for friction checks.",
+            )
+            force_scale_number = self.server.gui.add_number(
+                "Force violation scale",
+                self.force_scale,
+                min=0.0,
+                step=0.0005,
+                hint="Meters of red contact violation arrow per Newton.",
+            )
+            joint_scale_number = self.server.gui.add_number(
+                "Torque violation scale",
+                self.joint_torque_scale,
+                min=0.0,
+                step=0.002,
+                hint="Meters of red joint violation arrow per Newton-meter.",
+            )
+            self.constraint_status_text = self.server.gui.add_text(
+                "Constraints",
+                "",
+                disabled=True,
+            )
+
+        @lambda_number.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.whittaker_lmbda = float(lambda_number.value)
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+        @torque_limit_scale_number.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.torque_limit_scale = float(torque_limit_scale_number.value)
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+        @friction_number.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.friction_coefficient = float(friction_number.value)
+                self.contact_resolver.friction_coefficient = self.friction_coefficient
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+        @friction_facets_number.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.friction_facets = max(3, int(round(float(friction_facets_number.value))))
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+        @cone_dropdown.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.friction_conservative = str(cone_dropdown.value) == self.CONSERVATIVE_CONE
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+        @tangential_damping_number.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.contact_tangential_damping = float(tangential_damping_number.value)
+                self.contact_resolver.tangential_damping = self.contact_tangential_damping
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+        @force_scale_number.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.force_scale = float(force_scale_number.value)
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+        @joint_scale_number.on_update
+        def _(_) -> None:
+            with self.playback_lock:
+                self.joint_torque_scale = float(joint_scale_number.value)
+                self._render_frame(self.active_motion, int(self.playback["frame"]))
+
+    def _render_extra_frame(
+        self,
+        motion: _ViewerMotion,
+        frame_index: int,
+        state: torch.Tensor,
+        split: SplitState,
+        contact_poses: ContactPoses,
+    ) -> None:
+        """Render input-constraint violation arrows."""
+        evaluation = self._evaluate_input_constraints(motion, frame_index, state, split, contact_poses)
+        self._update_joint_constraint_violations(state, evaluation)
+        self._update_contact_constraint_violations(contact_poses, evaluation)
+        self._update_constraint_status(evaluation)
+
+    def _evaluate_input_constraints(
+        self,
+        motion: _ViewerMotion,
+        frame_index: int,
+        state: torch.Tensor,
+        split: SplitState,
+        contact_poses: ContactPoses,
+    ) -> _InputConstraintEvaluation:
+        """Compute one frame of constraint residuals and visualization vectors."""
+        assert self.model.contact_model is not None
+        estimate = self._estimate_for_motion(motion)
+        generalized_acceleration = estimate.generalized_accelerations[frame_index]
+        generalized_force = self.model.generalized_forces_from_acceleration(
+            state,
+            generalized_acceleration,
+        )
+        contact_state = self.contact_detector.detect(contact_poses.positions)
+        contact_velocities = self._contact_velocities(state, split)
+        support_force = torch.clamp(
+            torch.dot(
+                generalized_force[:3],
+                self.contact_detector.normal.to(dtype=generalized_force.dtype, device=generalized_force.device),
+            ),
+            min=0.0,
+        )
+        resolved = self.contact_resolver.resolve(
+            contact_state,
+            contact_velocities=contact_velocities,
+            total_normal_force=support_force,
+            contact_poses=contact_poses,
+        )
+        control_input = torch.zeros(self.model.input_dim, dtype=self.model.dtype, device=self.model.device)
+        control_input[: self.model.n_joints] = generalized_force[6:]
+        control_input[self.model.n_joints :] = resolved.forces.reshape(-1)
+
+        torque_limits = max(self.torque_limit_scale, 0.0) * self.joint_effort_limits
+        joint_constraint = JointTorqueLimits(
+            -torque_limits,
+            torque_limits,
+            input_dim=self.model.input_dim,
+            dtype=self.model.dtype,
+            device=self.model.device,
+        )
+        normal_constraint = PositiveNormalContactForces(
+            input_dim=self.model.input_dim,
+            num_contacts=self.model.contact_model.num_contacts,
+            contact_force_start=self.model.n_joints,
+            dtype=self.model.dtype,
+            device=self.model.device,
+        )
+        friction_constraint = LinearizedFrictionCone(
+            self.friction_coefficient,
+            input_dim=self.model.input_dim,
+            num_contacts=self.model.contact_model.num_contacts,
+            contact_force_start=self.model.n_joints,
+            num_facets=self.friction_facets,
+            conservative=self.friction_conservative,
+            dtype=self.model.dtype,
+            device=self.model.device,
+        )
+
+        joint_residual = joint_constraint(control_input)
+        upper_violation = torch.clamp(joint_residual[: self.model.n_joints], min=0.0)
+        lower_violation = torch.clamp(joint_residual[self.model.n_joints :], min=0.0)
+        joint_violation_magnitudes = torch.maximum(upper_violation, lower_violation)
+        joint_violation_signs = torch.where(
+            upper_violation >= lower_violation,
+            torch.ones_like(joint_violation_magnitudes),
+            -torch.ones_like(joint_violation_magnitudes),
+        )
+        joint_violation_signs = torch.where(
+            joint_violation_magnitudes > 0.0,
+            joint_violation_signs,
+            torch.zeros_like(joint_violation_signs),
+        )
+
+        normal_force_violation = torch.clamp(normal_constraint(control_input), min=0.0)
+        friction_residual = friction_constraint(control_input).reshape(
+            self.model.contact_model.num_contacts,
+            friction_constraint.num_facets,
+        )
+        friction_violation, friction_facet_indices = torch.max(
+            torch.clamp(friction_residual, min=0.0),
+            dim=-1,
+        )
+        friction_directions_world = self._friction_violation_directions_world(
+            contact_poses,
+            friction_constraint,
+            friction_facet_indices,
+        )
+        return _InputConstraintEvaluation(
+            generalized_force=generalized_force,
+            joint_torques=generalized_force[6:],
+            contact_forces=resolved.forces,
+            world_contact_forces=resolved.world_forces,
+            joint_violation_magnitudes=joint_violation_magnitudes,
+            joint_violation_signs=joint_violation_signs,
+            normal_force_violation=normal_force_violation,
+            friction_violation=friction_violation,
+            friction_violation_directions_world=friction_directions_world,
+            active_contacts=resolved.active,
+            total_normal_force=torch.sum(resolved.normal_forces),
+        )
+
+    def _friction_violation_directions_world(
+        self,
+        contact_poses: ContactPoses,
+        friction_constraint: LinearizedFrictionCone,
+        facet_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return world-frame tangent directions for max friction violations."""
+        num_facets = friction_constraint.num_facets
+        dtype = self.model.dtype
+        device = self.model.device
+        phase = torch.as_tensor(friction_constraint.facet_phase, dtype=dtype, device=device)
+        angles = phase + (2.0 * torch.pi / num_facets) * torch.arange(
+            num_facets,
+            dtype=dtype,
+            device=device,
+        )
+        tangent_directions = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+        selected = tangent_directions[facet_indices]
+        local = torch.zeros(selected.shape[0], 3, dtype=dtype, device=device)
+        local[:, friction_constraint.tangent_axes[0]] = selected[:, 0]
+        local[:, friction_constraint.tangent_axes[1]] = selected[:, 1]
+        rotations = contact_poses.transforms[..., :3, :3].to(dtype=dtype, device=device)
+        return torch.matmul(rotations, local.unsqueeze(-1)).squeeze(-1)
+
+    def _update_joint_constraint_violations(
+        self,
+        state: torch.Tensor,
+        evaluation: _InputConstraintEvaluation,
+    ) -> None:
+        """Update the largest joint torque violation arrows."""
+        violation_indices = torch.nonzero(evaluation.joint_violation_magnitudes > 0.0).flatten()
+        if violation_indices.numel() == 0:
+            for rank in range(self.top_joint_count):
+                self._hide_joint_constraint_violation(rank)
+            return
+        count = min(self.top_joint_count, violation_indices.numel())
+        violation_magnitudes = evaluation.joint_violation_magnitudes[violation_indices]
+        magnitudes, order = torch.topk(violation_magnitudes, k=count)
+        indices = violation_indices[order]
+        positions, axes = self._joint_child_positions_and_axes(state, indices.tolist())
+        for rank in range(self.top_joint_count):
+            if rank >= count or float(magnitudes[rank]) <= 1e-9:
+                self._hide_joint_constraint_violation(rank)
+                continue
+            joint_index = int(indices[rank])
+            magnitude = float(magnitudes[rank].detach().cpu())
+            sign = float(evaluation.joint_violation_signs[joint_index].detach().cpu())
+            vector = axes[rank] * sign * magnitude * self.joint_torque_scale
+            _update_vector_arrow(
+                self.constraint_joint_violation_handles[rank],
+                self.constraint_joint_violation_tip_handles[rank],
+                positions[rank],
+                vector,
+            )
+            self._replace_joint_constraint_label(
+                rank,
+                f"{self.model.joint_names[joint_index]} +{magnitude:.1f} Nm",
+                positions[rank] + np.array([0.0, 0.0, 0.08]),
+            )
+
+        for rank in range(count, self.top_joint_count):
+            self._hide_joint_constraint_violation(rank)
+
+    def _hide_joint_constraint_violation(self, rank: int) -> None:
+        """Hide one ranked joint torque violation overlay."""
+        self.constraint_joint_violation_handles[rank].visible = False
+        self.constraint_joint_violation_tip_handles[rank].visible = False
+        self._remove_joint_constraint_label(rank)
+
+    def _replace_joint_constraint_label(self, rank: int, text: str, position: np.ndarray) -> None:
+        """Replace a joint constraint label because Viser labels are immutable."""
+        assert self.server is not None
+        self._remove_joint_constraint_label(rank)
+        self.constraint_joint_violation_labels[rank] = self.server.scene.add_label(
+            f"/input_constraints/joint_violation_label/{rank}",
+            text,
+            position=tuple(float(value) for value in position),
+            font_screen_scale=0.75,
+            anchor="bottom-center",
+        )
+
+    def _remove_joint_constraint_label(self, rank: int) -> None:
+        """Remove an existing joint constraint label."""
+        label = self.constraint_joint_violation_labels[rank]
+        if label is not None:
+            label.remove()
+            self.constraint_joint_violation_labels[rank] = None
+
+    def _update_contact_constraint_violations(
+        self,
+        contact_poses: ContactPoses,
+        evaluation: _InputConstraintEvaluation,
+    ) -> None:
+        """Update contact normal and friction violation arrows."""
+        positions = contact_poses.positions.detach().cpu().numpy()
+        rotations = contact_poses.transforms[..., :3, :3].to(dtype=self.model.dtype, device=self.model.device)
+        normals_world = rotations[..., :, 2]
+        normal_violation = evaluation.normal_force_violation.detach().cpu().numpy()
+        friction_violation = evaluation.friction_violation.detach().cpu().numpy()
+        friction_directions = evaluation.friction_violation_directions_world.detach().cpu().numpy()
+        normals = normals_world.detach().cpu().numpy()
+        for index, point in enumerate(positions):
+            normal_vector = -normals[index] * normal_violation[index] * self.force_scale
+            friction_vector = friction_directions[index] * friction_violation[index] * self.force_scale
+            _update_vector_arrow(
+                self.normal_force_violation_handles[index],
+                self.normal_force_violation_tip_handles[index],
+                point,
+                normal_vector,
+            )
+            _update_vector_arrow(
+                self.friction_violation_handles[index],
+                self.friction_violation_tip_handles[index],
+                point,
+                friction_vector,
+            )
+
+    def _update_constraint_status(self, evaluation: _InputConstraintEvaluation) -> None:
+        """Update the input constraint status text."""
+        if self.constraint_status_text is None:
+            return
+        joint_count = int(torch.count_nonzero(evaluation.joint_violation_magnitudes > 0.0).item())
+        normal_count = int(torch.count_nonzero(evaluation.normal_force_violation > 0.0).item())
+        friction_count = int(torch.count_nonzero(evaluation.friction_violation > 0.0).item())
+        active_count = int(torch.count_nonzero(evaluation.active_contacts).item())
+        max_joint = float(torch.max(evaluation.joint_violation_magnitudes).detach().cpu())
+        max_normal = float(torch.max(evaluation.normal_force_violation).detach().cpu())
+        max_friction = float(torch.max(evaluation.friction_violation).detach().cpu())
+        total_normal = float(evaluation.total_normal_force.detach().cpu())
+        self.constraint_status_text.value = (
+            f"violations: joint {joint_count} max {max_joint:.1f} Nm | "
+            f"normal {normal_count} max {max_normal:.1f} N | "
+            f"friction {friction_count} max {max_friction:.1f} N | "
+            f"active contacts {active_count} | normal force {total_normal:.1f} N"
+        )
+
+
 def run_contact_viewer(
     *,
     asset_name: str = "unitree_g1",
@@ -1216,6 +1737,53 @@ def run_dynamics_verification_viewer(
     ).run()
 
 
+def run_input_constraint_verification_viewer(
+    *,
+    asset_name: str = "unitree_g1",
+    contact_mode: str = "feet_corners",
+    fps: float = 30.0,
+    port: int = 8080,
+    load_meshes: bool = True,
+    robot_opacity: float = 0.35,
+    max_frames: int | None = None,
+    motion_reference: str | Path | None = None,
+    synthetic_motion: bool = False,
+    whittaker_lmbda: float = 100.0,
+    whittaker_d_order: int = 2,
+    contact_threshold: float = 0.025,
+    top_joint_count: int = 8,
+    torque_limit_scale: float = 1.0,
+    friction_coefficient: float = 0.8,
+    friction_facets: int = 8,
+    friction_conservative: bool = True,
+    contact_tangential_damping: float = 50.0,
+    force_violation_scale: float = 0.002,
+) -> None:
+    """Run the specialized Viser viewer for input constraint checks."""
+    InputConstraintVerificationViewer(
+        asset_name=asset_name,
+        contact_mode=contact_mode,
+        contact_force_frame="contact",
+        fps=fps,
+        port=port,
+        load_meshes=load_meshes,
+        robot_opacity=robot_opacity,
+        max_frames=max_frames,
+        motion_reference=motion_reference,
+        synthetic_motion=synthetic_motion,
+        whittaker_lmbda=whittaker_lmbda,
+        whittaker_d_order=whittaker_d_order,
+        contact_threshold=contact_threshold,
+        top_joint_count=top_joint_count,
+        torque_limit_scale=torque_limit_scale,
+        friction_coefficient=friction_coefficient,
+        friction_facets=friction_facets,
+        friction_conservative=friction_conservative,
+        contact_tangential_damping=contact_tangential_damping,
+        force_violation_scale=force_violation_scale,
+    ).run()
+
+
 def export_dynamics_verification_videos(
     *,
     output_dir: str | Path,
@@ -1289,11 +1857,18 @@ def main() -> None:
     parser.add_argument("--motion-reference", type=Path, default=None)
     parser.add_argument("--synthetic-motion", action="store_true")
     parser.add_argument("--dynamics-verification", action="store_true")
+    parser.add_argument("--input-constraint-verification", action="store_true")
     parser.add_argument("--contact-force-frame", choices=("world", "contact"), default="world")
     parser.add_argument("--whittaker-lambda", type=float, default=100.0)
     parser.add_argument("--whittaker-d-order", type=int, default=2)
     parser.add_argument("--contact-threshold", type=float, default=0.025)
     parser.add_argument("--top-joints", type=int, default=8)
+    parser.add_argument("--torque-limit-scale", type=float, default=1.0)
+    parser.add_argument("--friction-coefficient", type=float, default=0.8)
+    parser.add_argument("--friction-facets", type=int, default=8)
+    parser.add_argument("--friction-cone-outer", action="store_true")
+    parser.add_argument("--contact-tangential-damping", type=float, default=50.0)
+    parser.add_argument("--force-violation-scale", type=float, default=0.002)
     parser.add_argument("--export-video", type=Path, default=None)
     parser.add_argument("--export-dynamics-videos", type=Path, default=None)
     parser.add_argument("--export-width", type=int, default=1280)
@@ -1301,10 +1876,12 @@ def main() -> None:
     parser.add_argument("--export-frames", type=int, default=None)
     parser.add_argument("--export-browser", type=Path, default=None)
     args = parser.parse_args()
+    if args.dynamics_verification and args.input_constraint_verification:
+        parser.error("--dynamics-verification and --input-constraint-verification are mutually exclusive.")
 
     robot_opacity = args.robot_opacity
     if robot_opacity is None:
-        robot_opacity = 0.35 if args.dynamics_verification else 1.0
+        robot_opacity = 0.35 if args.dynamics_verification or args.input_constraint_verification else 1.0
     kwargs = dict(
         asset_name=args.asset,
         contact_mode=args.contact_mode,
@@ -1332,7 +1909,28 @@ def main() -> None:
         )
         return
     if args.export_video is not None:
-        if args.dynamics_verification:
+        if args.input_constraint_verification:
+            InputConstraintVerificationViewer(
+                **kwargs,
+                contact_force_frame="contact",
+                whittaker_lmbda=args.whittaker_lambda,
+                whittaker_d_order=args.whittaker_d_order,
+                contact_threshold=args.contact_threshold,
+                top_joint_count=args.top_joints,
+                torque_limit_scale=args.torque_limit_scale,
+                friction_coefficient=args.friction_coefficient,
+                friction_facets=args.friction_facets,
+                friction_conservative=not args.friction_cone_outer,
+                contact_tangential_damping=args.contact_tangential_damping,
+                force_violation_scale=args.force_violation_scale,
+            ).export_video(
+                args.export_video,
+                width=args.export_width,
+                height=args.export_height,
+                frame_count=args.export_frames,
+                browser_executable=args.export_browser,
+            )
+        elif args.dynamics_verification:
             DynamicsVerificationViewer(
                 **kwargs,
                 contact_force_frame=args.contact_force_frame,
@@ -1356,7 +1954,21 @@ def main() -> None:
                 browser_executable=args.export_browser,
             )
         return
-    if args.dynamics_verification:
+    if args.input_constraint_verification:
+        run_input_constraint_verification_viewer(
+            **kwargs,
+            whittaker_lmbda=args.whittaker_lambda,
+            whittaker_d_order=args.whittaker_d_order,
+            contact_threshold=args.contact_threshold,
+            top_joint_count=args.top_joints,
+            torque_limit_scale=args.torque_limit_scale,
+            friction_coefficient=args.friction_coefficient,
+            friction_facets=args.friction_facets,
+            friction_conservative=not args.friction_cone_outer,
+            contact_tangential_damping=args.contact_tangential_damping,
+            force_violation_scale=args.force_violation_scale,
+        )
+    elif args.dynamics_verification:
         run_dynamics_verification_viewer(
             **kwargs,
             contact_force_frame=args.contact_force_frame,
@@ -1372,6 +1984,12 @@ def main() -> None:
 def dynamics_main() -> None:
     """Launch the dynamics verification viewer from its dedicated CLI."""
     sys.argv.insert(1, "--dynamics-verification")
+    main()
+
+
+def input_constraints_main() -> None:
+    """Launch the input constraint verification viewer from its dedicated CLI."""
+    sys.argv.insert(1, "--input-constraint-verification")
     main()
 
 
@@ -1486,6 +2104,28 @@ def _animation_status(
     return f"{state} | {motion_label} | frame {frame + 1}/{num_frames}"
 
 
+def _joint_effort_limit_tensor(model: FloatingBaseDynamics) -> torch.Tensor:
+    """Return URDF effort limits in the model joint order."""
+    if len(model.asset.urdf.joints) != len(model.joint_names):
+        raise ValueError("URDF joint count does not match the dynamics joint count.")
+    limits: list[float] = []
+    missing: list[str] = []
+    for index, joint in enumerate(model.asset.urdf.joints):
+        if joint.name != model.joint_names[index]:
+            raise ValueError("URDF joint order does not match the dynamics joint order.")
+        if joint.effort is None:
+            missing.append(joint.name)
+            limits.append(0.0)
+        else:
+            limits.append(float(joint.effort))
+    if missing:
+        raise ValueError(f"Missing effort limits for joints: {', '.join(missing)}")
+    effort_limits = torch.as_tensor(limits, dtype=model.dtype, device=model.device)
+    if torch.any(effort_limits <= 0.0):
+        raise ValueError("Joint effort limits must be positive.")
+    return effort_limits
+
+
 def _update_vector_cylinder(handle: Any | None, origin: np.ndarray, vector: np.ndarray) -> None:
     """Update a Viser cylinder so it represents a vector."""
     if handle is None:
@@ -1499,6 +2139,25 @@ def _update_vector_cylinder(handle: Any | None, origin: np.ndarray, vector: np.n
     handle.wxyz = _wxyz_from_z_axis(vector)
     handle.scale = (1.0, 1.0, length)
     handle.visible = True
+
+
+def _update_vector_arrow(
+    shaft_handle: Any | None,
+    tip_handle: Any | None,
+    origin: np.ndarray,
+    vector: np.ndarray,
+) -> None:
+    """Update a cylinder and tip sphere so they read as an arrow."""
+    _update_vector_cylinder(shaft_handle, origin, vector)
+    if tip_handle is None:
+        return
+    length = float(np.linalg.norm(vector))
+    if not np.isfinite(length) or length <= 1e-9:
+        tip_handle.visible = False
+        return
+    tip = np.asarray(origin, dtype=np.float64) + np.asarray(vector, dtype=np.float64)
+    tip_handle.position = tuple(float(value) for value in tip)
+    tip_handle.visible = True
 
 
 def _wxyz_from_z_axis(vector: np.ndarray) -> tuple[float, float, float, float]:

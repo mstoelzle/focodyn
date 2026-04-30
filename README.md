@@ -141,7 +141,7 @@ uv run --extra viz focodyn-plot-motion-derivatives --lambdas 10 100 1000 10000 -
 
 ## Visualization
 
-The `viz` extra provides two Viser-based viewers.
+The `viz` extra provides three Viser-based viewers.
 
 ### Kinematic Trajectory Viewer
 
@@ -209,6 +209,35 @@ launches a temporary headless browser client, captures each frame with Viser,
 and writes H.264 MP4 files. Pass `--export-frames N` for a shorter clip during
 tests, or `--export-browser /path/to/browser` if Chrome/Chromium is not on the
 standard path.
+
+### Input Constraint Verification Viewer
+
+For checking the affine input constraints along a kinematic reference, use:
+
+```bash
+uv run --extra viz focodyn-visualize-input-constraints --whittaker-lambda 100
+```
+
+This viewer follows the same derivative-estimation path as the dynamics
+verification viewer. For each frame, it estimates `nu_dot`, computes
+`M(q) nu_dot + h(q, nu)`, uses the actuated block as the joint torque estimate,
+and resolves rough flat-ground contact forces in the local contact frames. It
+then builds `u = [tau, lambda_C]` and evaluates the joint torque, positive
+normal force, and linearized friction cone constraints.
+
+Red arrows indicate constraint violations. Joint arrows are drawn at the
+violating joints and point along the joint axis, while contact arrows mark
+negative normal-force or friction-cone violations at the contact frames. The
+side panel exposes the URDF effort-limit scale, friction coefficient, number of
+friction facets (eight by default), conservative/outer cone mode, tangential
+damping used by the rough contact resolver, and separate scales for force and
+torque violation arrows.
+
+The same mode is available from the main viewer:
+
+```bash
+uv run --extra viz focodyn-visualize-g1 --input-constraint-verification
+```
 
 ## Sources And Attribution
 
