@@ -701,6 +701,7 @@ class DynamicsVerificationViewer(KinematicTrajectoryViewer):
 
     F_MODE = "f(x): inverse dynamics"
     G_MODE = "g(x): contact projection"
+    FIXED_CONTACT_MODE = "fixed-contact force estimate"
     JOINT_TORQUE_ARROWS = "arrows"
     JOINT_TORQUE_LABELS = "labels"
     JOINT_TORQUE_ARROWS_AND_LABELS = "arrows + labels"
@@ -828,9 +829,9 @@ class DynamicsVerificationViewer(KinematicTrajectoryViewer):
         with self.server.gui.add_folder("Dynamics Verification", expand_by_default=True):
             mode_dropdown = self.server.gui.add_dropdown(
                 "Mode",
-                (self.F_MODE, self.G_MODE),
+                (self.F_MODE, self.G_MODE, self.FIXED_CONTACT_MODE),
                 initial_value=self.dynamics_mode,
-                hint="Choose whether to visualize inverse dynamics or contact-force projection.",
+                hint="Choose whether to visualize inverse dynamics or contact-force estimates.",
             )
             joint_viz_dropdown = self.server.gui.add_dropdown(
                 "Joint torque viz",
@@ -935,13 +936,23 @@ class DynamicsVerificationViewer(KinematicTrajectoryViewer):
             )
             self._hide_contact_forces()
             contact_summary = "contacts ignored"
-        else:
+        elif self.dynamics_mode == self.G_MODE:
             generalized_force, contact_summary = self._contact_projected_generalized_force(
                 state,
                 split,
                 contact_poses,
                 generalized_acceleration,
             )
+        else:
+            generalized_force, contact_summary = self._fixed_contact_generalized_force(
+                state,
+                contact_poses,
+                generalized_acceleration,
+            )
+            self._hide_root_wrench()
+            self._hide_joint_torques()
+            self._update_contact_force_status(contact_summary)
+            return
 
         self._update_root_wrench(state, generalized_force[:6])
         self._update_joint_torques(state, generalized_force[6:])
@@ -1002,6 +1013,54 @@ class DynamicsVerificationViewer(KinematicTrajectoryViewer):
         total_normal = float(torch.sum(resolved.normal_forces).detach().cpu())
         return generalized_force, f"{active_count} contacts | normal {total_normal:.1f} N"
 
+    def _fixed_contact_generalized_force(
+        self,
+        state: torch.Tensor,
+        contact_poses: ContactPoses,
+        generalized_acceleration: torch.Tensor,
+    ) -> tuple[torch.Tensor, str]:
+        """Estimate fixed-contact forces and project them through ``B(q)``."""
+        assert self.model.contact_model is not None
+        contact_state = self.contact_detector.detect(contact_poses.positions)
+        desired_generalized_force = self.model.generalized_forces_from_acceleration(
+            state,
+            generalized_acceleration,
+        )
+        fixed_forces = self.model.fixed_contact_forces_from_joint_torques(
+            state,
+            desired_generalized_force[6:],
+            active_contacts=contact_state.in_contact,
+            force_frame=self.contact_force_frame,
+            force_direction="environment_on_robot",
+        )
+        control_input = torch.zeros(self.model.input_dim, dtype=self.model.dtype, device=self.model.device)
+        control_input[self.model.n_joints :] = fixed_forces.forces.reshape(-1)
+        generalized_force = self.model.generalized_forces_from_input(state, control_input)
+        self._update_contact_forces(contact_poses.positions, fixed_forces.world_forces)
+
+        normals = contact_poses.transforms[..., :3, 2].to(dtype=self.model.dtype, device=self.model.device)
+        tangential = fixed_forces.world_forces - fixed_forces.normal_forces.unsqueeze(-1) * normals
+        friction_ratio = torch.linalg.norm(tangential, dim=-1) / torch.clamp(
+            0.8 * fixed_forces.normal_forces,
+            min=1e-9,
+        )
+        active_count = int(torch.count_nonzero(fixed_forces.active_contacts).item())
+        total_normal = float(torch.sum(fixed_forces.normal_forces).detach().cpu())
+        max_ratio = float(torch.max(friction_ratio).detach().cpu()) if friction_ratio.numel() else 0.0
+        residual = float(torch.linalg.norm(fixed_forces.equation_residual).detach().cpu())
+        return (
+            generalized_force,
+            f"{active_count} fixed contacts | normal {total_normal:.1f} N | "
+            f"max friction ratio {max_ratio:.2f} | residual {residual:.1e}",
+        )
+
+    def _hide_root_wrench(self) -> None:
+        """Hide root force and torque overlays."""
+        if self.root_force_handle is not None:
+            self.root_force_handle.visible = False
+        if self.root_torque_handle is not None:
+            self.root_torque_handle.visible = False
+
     def _contact_velocities(self, state: torch.Tensor, split: SplitState) -> torch.Tensor:
         """Compute world-frame contact point velocities."""
         assert self.model.contact_model is not None
@@ -1031,6 +1090,11 @@ class DynamicsVerificationViewer(KinematicTrajectoryViewer):
         """Hide contact force vectors."""
         for handle in self.contact_force_handles:
             handle.visible = False
+
+    def _hide_joint_torques(self) -> None:
+        """Hide every ranked joint-torque overlay."""
+        for rank in range(self.top_joint_count):
+            self._hide_joint_torque_overlay(rank)
 
     def _update_joint_torques(self, state: torch.Tensor, joint_torques: torch.Tensor) -> None:
         """Update top joint torque arrows and labels."""
@@ -1156,6 +1220,12 @@ class DynamicsVerificationViewer(KinematicTrajectoryViewer):
             f"{self.dynamics_mode} | root F {root_force_norm:.1f} N | "
             f"root M {root_torque_norm:.1f} Nm | max joint {max_joint:.1f} Nm | {contact_summary}"
         )
+
+    def _update_contact_force_status(self, contact_summary: str) -> None:
+        """Update status text for the contact-force-only mode."""
+        if self.dynamics_status_text is None:
+            return
+        self.dynamics_status_text.value = f"{self.dynamics_mode} | {contact_summary}"
 
 
 class InputConstraintVerificationViewer(DynamicsVerificationViewer):

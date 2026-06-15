@@ -32,6 +32,12 @@ def test_contact_fk_and_jacobian_shapes(model: FloatingBaseDynamics) -> None:
     quaternions = model.contact_model.contact_quaternions(base_transform, split.joint_positions.squeeze(0))
     normals = model.contact_model.contact_normals(base_transform, split.joint_positions.squeeze(0))
     jacobian = model.contact_model.contact_jacobian(base_transform, split.joint_positions.squeeze(0))
+    jacobian_dot = model.contact_model.contact_jacobian_dot(
+        base_transform,
+        split.joint_positions.squeeze(0),
+        split.base_velocity.squeeze(0),
+        split.joint_velocities.squeeze(0),
+    )
     spatial_jacobian = model.contact_model.contact_spatial_jacobian(
         base_transform, split.joint_positions.squeeze(0)
     )
@@ -42,12 +48,14 @@ def test_contact_fk_and_jacobian_shapes(model: FloatingBaseDynamics) -> None:
     assert poses.transforms.shape == (8, 4, 4)
     assert normals.shape == (8, 3)
     assert jacobian.shape == (24, model.nv)
+    assert jacobian_dot.shape == (24, model.nv)
     assert spatial_jacobian.shape == (48, model.nv)
     assert torch.isfinite(positions).all()
     assert torch.isfinite(poses.quaternions_wxyz).all()
     assert torch.isfinite(quaternions).all()
     assert torch.isfinite(normals).all()
     assert torch.isfinite(jacobian).all()
+    assert torch.isfinite(jacobian_dot).all()
     unit = torch.ones(8, dtype=model.dtype)
     assert torch.allclose(torch.linalg.norm(poses.quaternions_wxyz, dim=-1), unit)
     assert torch.allclose(torch.linalg.norm(quaternions, dim=-1), unit)
@@ -66,6 +74,12 @@ def test_batched_contact_fk_and_jacobian_shapes(model: FloatingBaseDynamics) -> 
     poses = model.contact_model.contact_poses(base_transform, split.joint_positions)
     normals = model.contact_model.contact_normals(base_transform, split.joint_positions)
     jacobian = model.contact_model.contact_jacobian(base_transform, split.joint_positions)
+    jacobian_dot = model.contact_model.contact_jacobian_dot(
+        base_transform,
+        split.joint_positions,
+        split.base_velocity,
+        split.joint_velocities,
+    )
     spatial_jacobian = model.contact_model.contact_spatial_jacobian(
         base_transform, split.joint_positions
     )
@@ -74,11 +88,13 @@ def test_batched_contact_fk_and_jacobian_shapes(model: FloatingBaseDynamics) -> 
     assert poses.transforms.shape == (2, 8, 4, 4)
     assert normals.shape == (2, 8, 3)
     assert jacobian.shape == (2, 24, model.nv)
+    assert jacobian_dot.shape == (2, 24, model.nv)
     assert spatial_jacobian.shape == (2, 48, model.nv)
     assert torch.isfinite(poses.positions).all()
     assert torch.isfinite(poses.quaternions_wxyz).all()
     assert torch.isfinite(normals).all()
     assert torch.isfinite(jacobian).all()
+    assert torch.isfinite(jacobian_dot).all()
     assert torch.isfinite(spatial_jacobian).all()
 
 
@@ -131,6 +147,86 @@ def test_contact_jacobian_matches_autograd_contact_fk(model: FloatingBaseDynamic
     autodiff_jacobian = torch.autograd.functional.jacobian(contact_positions_from_joints, q)
     analytical_jacobian = model.contact_model.contact_jacobian(base_transform, q.detach())[:, 6:]
     assert torch.allclose(analytical_jacobian, autodiff_jacobian, atol=1e-8, rtol=1e-7)
+
+
+def test_contact_jacobian_dot_velocity_matches_finite_difference() -> None:
+    pytest.importorskip("adam")
+    model = FloatingBaseDynamics(
+        "unitree_g1",
+        include_contact_forces=True,
+        contact_mode="feet_centers",
+        dtype=torch.float64,
+    )
+    assert model.contact_model is not None
+    x = model.neutral_state()
+    split = model.split_state(x)
+    q = split.joint_positions.squeeze(0)
+    q = q + 0.02 * torch.sin(torch.arange(model.n_joints, dtype=model.dtype))
+    q_dot = 0.03 * torch.cos(torch.arange(model.n_joints, dtype=model.dtype))
+    base_velocity = torch.zeros(6, dtype=model.dtype)
+    velocity = torch.cat((base_velocity, q_dot))
+    base_transform = model.base_transform(x)
+    eps = 1e-6
+
+    jacobian_dot = model.contact_model.contact_jacobian_dot(
+        base_transform,
+        q,
+        base_velocity,
+        q_dot,
+    )
+    jacobian_plus = model.contact_model.contact_jacobian(base_transform, q + eps * q_dot)
+    jacobian_minus = model.contact_model.contact_jacobian(base_transform, q - eps * q_dot)
+    finite_difference = (jacobian_plus - jacobian_minus) / (2.0 * eps)
+
+    assert torch.allclose(
+        torch.matmul(jacobian_dot, velocity),
+        torch.matmul(finite_difference, velocity),
+        atol=2e-5,
+        rtol=2e-4,
+    )
+
+
+def test_contact_jacobian_dot_velocity_matches_autograd_jvp() -> None:
+    pytest.importorskip("adam")
+    model = FloatingBaseDynamics(
+        "unitree_g1",
+        include_contact_forces=True,
+        contact_mode="feet_centers",
+        dtype=torch.float64,
+    )
+    assert model.contact_model is not None
+    x = model.neutral_state()
+    split = model.split_state(x)
+    q = split.joint_positions.squeeze(0).detach()
+    q = q + 0.02 * torch.sin(torch.arange(model.n_joints, dtype=model.dtype))
+    q_dot = 0.03 * torch.cos(torch.arange(model.n_joints, dtype=model.dtype))
+    base_velocity = torch.zeros(6, dtype=model.dtype)
+    velocity = torch.cat((base_velocity, q_dot))
+    base_transform = model.base_transform(x)
+
+    def contact_velocity_from_joints(joint_positions: torch.Tensor) -> torch.Tensor:
+        jacobian = model.contact_model.contact_jacobian(base_transform, joint_positions)
+        return torch.matmul(jacobian, velocity)
+
+    _, autograd_jdot_velocity = torch.autograd.functional.jvp(
+        contact_velocity_from_joints,
+        q,
+        q_dot,
+        create_graph=False,
+    )
+    jacobian_dot = model.contact_model.contact_jacobian_dot(
+        base_transform,
+        q,
+        base_velocity,
+        q_dot,
+    )
+
+    assert torch.allclose(
+        torch.matmul(jacobian_dot, velocity),
+        autograd_jdot_velocity,
+        atol=2e-6,
+        rtol=2e-5,
+    )
 
 
 def test_contact_frame_force_mapping_is_supported() -> None:

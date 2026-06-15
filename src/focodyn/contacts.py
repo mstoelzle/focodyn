@@ -589,6 +589,76 @@ class FloatingBaseContactModel(torch.nn.Module):
             point_jacobian.shape[-1],
         )
 
+    def contact_jacobian_dot(
+        self,
+        base_transform: torch.Tensor,
+        joint_positions: torch.Tensor,
+        base_velocity: torch.Tensor,
+        joint_velocities: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the time derivative of the translational contact Jacobian.
+
+        The output is evaluated at the provided generalized velocity and maps
+        Adam mixed generalized velocity to stacked world-frame contact point
+        accelerations through ``Jdot_c(q, nu) nu``.
+
+        Args:
+            base_transform: Base-to-world transform ``W_H_B`` with shape
+                ``(4, 4)`` or ``(batch, 4, 4)``.
+            joint_positions: Joint position tensor with shape ``(n_joints,)``
+                or ``(batch, n_joints)``.
+            base_velocity: Mixed-representation base velocity with shape
+                ``(6,)`` or ``(batch, 6)``.
+            joint_velocities: Joint velocity tensor with shape ``(n_joints,)``
+                or ``(batch, n_joints)``.
+
+        Returns:
+            Translational Jacobian derivative with shape
+            ``(3 * num_contacts, 6 + n_joints)`` or batched shape
+            ``(batch, 3 * num_contacts, 6 + n_joints)``.
+        """
+        link_transforms = self._contact_link_tensors(
+            self._stack_link_transforms(base_transform, joint_positions)
+        )
+        link_jacobians = self._contact_link_tensors(
+            self._stack_link_jacobians(base_transform, joint_positions)
+        )
+        link_jacobian_dots = self._contact_link_tensors(
+            self._stack_link_jacobian_dots(
+                base_transform,
+                joint_positions,
+                base_velocity,
+                joint_velocities,
+            )
+        )
+        rotation = link_transforms[..., :3, :3]
+        offsets = self.local_offsets.to(dtype=rotation.dtype, device=rotation.device)
+        r_world = torch.matmul(rotation, offsets.unsqueeze(-1)).squeeze(-1)
+        linear_dot = link_jacobian_dots[..., :3, :]
+        angular_dot = link_jacobian_dots[..., 3:6, :]
+        angular = link_jacobians[..., 3:6, :]
+        velocity = torch.cat(
+            (
+                base_velocity.to(dtype=rotation.dtype, device=rotation.device),
+                joint_velocities.to(dtype=rotation.dtype, device=rotation.device),
+            ),
+            dim=-1,
+        )
+        while velocity.ndim < angular.ndim - 1:
+            velocity = velocity.unsqueeze(-2)
+        omega = torch.matmul(angular, velocity.unsqueeze(-1)).squeeze(-1)
+        r_dot = torch.cross(omega, r_world, dim=-1)
+        point_jacobian_dot = (
+            linear_dot
+            - torch.matmul(skew(r_world), angular_dot)
+            - torch.matmul(skew(r_dot), angular)
+        )
+        return point_jacobian_dot.reshape(
+            *point_jacobian_dot.shape[:-3],
+            3 * self.num_contacts,
+            point_jacobian_dot.shape[-1],
+        )
+
     def contact_spatial_jacobian(
         self, base_transform: torch.Tensor, joint_positions: torch.Tensor
     ) -> torch.Tensor:
@@ -755,6 +825,70 @@ class FloatingBaseContactModel(torch.nn.Module):
             for link_name in self.unique_contact_link_names
         ]
         return torch.stack(jacobians, dim=-3)
+
+    def _jacobian_dot(
+        self,
+        link_name: str,
+        base_transform: torch.Tensor,
+        joint_positions: torch.Tensor,
+        base_velocity: torch.Tensor,
+        joint_velocities: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate Adam mixed-representation link Jacobian derivative.
+
+        Args:
+            link_name: Link/frame name known to Adam.
+            base_transform: Base-to-world transform ``W_H_B``.
+            joint_positions: Joint position tensor.
+            base_velocity: Mixed-representation base velocity.
+            joint_velocities: Joint velocity tensor.
+
+        Returns:
+            Spatial Jacobian derivative with rows ordered as
+            ``(linear_velocity, angular_velocity)``.
+
+        Raises:
+            RuntimeError: If no Adam kinematics object was provided.
+        """
+        if self.kindyn is None:
+            raise RuntimeError("FloatingBaseContactModel requires an Adam KinDynComputations instance.")
+        return self.kindyn.jacobian_dot(
+            link_name,
+            base_transform,
+            joint_positions,
+            base_velocity,
+            joint_velocities,
+        )
+
+    def _stack_link_jacobian_dots(
+        self,
+        base_transform: torch.Tensor,
+        joint_positions: torch.Tensor,
+        base_velocity: torch.Tensor,
+        joint_velocities: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate Jacobian derivatives once per unique contact link.
+
+        Args:
+            base_transform: Base-to-world transform ``W_H_B``.
+            joint_positions: Joint position tensor.
+            base_velocity: Mixed-representation base velocity.
+            joint_velocities: Joint velocity tensor.
+
+        Returns:
+            Adam-order spatial Jacobian derivatives stacked by unique link.
+        """
+        jacobian_dots = [
+            self._jacobian_dot(
+                link_name,
+                base_transform,
+                joint_positions,
+                base_velocity,
+                joint_velocities,
+            )
+            for link_name in self.unique_contact_link_names
+        ]
+        return torch.stack(jacobian_dots, dim=-3)
 
     def _contact_link_tensors(self, unique_link_tensors: torch.Tensor) -> torch.Tensor:
         """Gather unique-link tensors into per-contact tensors.
