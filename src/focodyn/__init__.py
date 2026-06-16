@@ -7,7 +7,17 @@ from .contacts import (
     ResolvedContactForces,
     TerrainContactState,
 )
-from .dynamics import DynamicsTerms, FloatingBaseDynamics
+from .contact_force_analysis import (
+    FixedContactForceTrajectoryAnalysis,
+    analyze_fixed_contact_forces,
+    plot_fixed_contact_force_analysis,
+)
+from .dynamics import (
+    ContactSpaceDynamicsTerms,
+    DynamicsTerms,
+    FixedContactForces,
+    FloatingBaseDynamics,
+)
 from .input_constraints import (
     AffineConstraintTerms,
     AffineInputConstraint,
@@ -31,6 +41,9 @@ from .walking import simple_walking_sequence
 
 __all__ = [
     "DynamicsTerms",
+    "ContactSpaceDynamicsTerms",
+    "FixedContactForces",
+    "FixedContactForceTrajectoryAnalysis",
     "AffineConstraintTerms",
     "AffineInputConstraint",
     "StaticAffineInputConstraint",
@@ -49,10 +62,12 @@ __all__ = [
     "TerrainContactState",
     "ResolvedContactForces",
     "available_assets",
+    "analyze_fixed_contact_forces",
     "bundled_motion_reference_path",
     "default_g1_motion_reference",
     "estimate_motion_derivatives",
     "load_asset",
     "load_kinematic_motion_reference",
+    "plot_fixed_contact_force_analysis",
     "simple_walking_sequence",
 ]

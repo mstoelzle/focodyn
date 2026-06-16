@@ -30,6 +30,7 @@ focodyn-check-adam-g1 = "focodyn.cli.check_adam_g1:main"
 focodyn-visualize-g1 = "focodyn.visualization:main"
 focodyn-visualize-dynamics = "focodyn.visualization:dynamics_main"
 focodyn-visualize-input-constraints = "focodyn.visualization:input_constraints_main"
+focodyn-analyze-fixed-contact-forces = "focodyn.contact_force_analysis:main"
 
 [build-system]
 requires = ["uv_build>=0.11.8,<0.12.0"]

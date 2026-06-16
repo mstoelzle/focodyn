@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from focodyn import FloatingBaseDynamics
-from focodyn.dynamics import _build_adam_kindyn
+from focodyn.dynamics import _build_adam_kindyn, _contact_space_dynamics_from_matrices
 
 
 @pytest.fixture(scope="module")
@@ -140,6 +140,134 @@ def test_generalized_forces_from_input_supports_batched_inputs_and_rejects_wrong
     assert torch.allclose(generalized_force[:, 6:], u[:, : model.n_joints])
     with pytest.raises(ValueError, match="input dimension"):
         model.generalized_forces_from_input(x0, torch.zeros(model.input_dim + 1, dtype=model.dtype))
+
+
+def test_contact_space_dynamics_from_matrices_matches_contact_space_equations() -> None:
+    mass = torch.diag(torch.tensor([2.0, 3.0, 5.0], dtype=torch.float64)).unsqueeze(0)
+    coriolis = torch.tensor([[0.3, -0.2, 0.4]], dtype=torch.float64)
+    gravity = torch.tensor([[0.0, 1.5, -2.0]], dtype=torch.float64)
+    jacobian = torch.tensor([[[1.0, 0.2, -0.1], [0.0, 1.0, 0.3]]], dtype=torch.float64)
+    jacobian_dot = torch.tensor([[[0.1, -0.2, 0.0], [0.0, 0.05, 0.2]]], dtype=torch.float64)
+    velocity = torch.tensor([[0.4, -0.1, 0.2]], dtype=torch.float64)
+    active_contacts = torch.tensor([[True]], dtype=torch.bool)
+
+    terms = _contact_space_dynamics_from_matrices(
+        mass_matrix=mass,
+        coriolis=coriolis,
+        gravity=gravity,
+        contact_jacobian=jacobian,
+        contact_jacobian_dot=jacobian_dot,
+        generalized_velocity=velocity,
+        active_contacts=active_contacts,
+        pinv_rcond=1e-12,
+    )
+
+    mass_inverse_jacobian_transpose = torch.linalg.solve(mass, jacobian.transpose(-1, -2))
+    expected_inverse_contact_inertia = torch.matmul(jacobian, mass_inverse_jacobian_transpose)
+    expected_contact_inertia = torch.linalg.pinv(expected_inverse_contact_inertia, rtol=1e-12)
+    expected_dynamic_inverse = torch.matmul(mass_inverse_jacobian_transpose, expected_contact_inertia)
+    expected_jdot_velocity = torch.matmul(jacobian_dot, velocity.unsqueeze(-1)).squeeze(-1)
+    expected_bias = (
+        torch.matmul(expected_dynamic_inverse.transpose(-1, -2), coriolis.unsqueeze(-1)).squeeze(-1)
+        - torch.matmul(expected_contact_inertia, expected_jdot_velocity.unsqueeze(-1)).squeeze(-1)
+    )
+    expected_gravity = torch.matmul(
+        expected_dynamic_inverse.transpose(-1, -2),
+        gravity.unsqueeze(-1),
+    ).squeeze(-1)
+    gamma = torch.tensor([[0.7, -0.4, 0.2]], dtype=torch.float64)
+    projected_gamma = torch.matmul(expected_dynamic_inverse.transpose(-1, -2), gamma.unsqueeze(-1)).squeeze(-1)
+    paper_contact_force = projected_gamma - expected_bias - expected_gravity
+
+    assert torch.allclose(terms.contact_inertia, expected_contact_inertia)
+    assert torch.allclose(terms.dynamic_inverse, expected_dynamic_inverse)
+    assert torch.allclose(terms.jacobian_dot_velocity, expected_jdot_velocity)
+    assert torch.allclose(terms.contact_bias, expected_bias)
+    assert torch.allclose(terms.contact_gravity, expected_gravity)
+    assert torch.allclose(
+        terms.contact_bias + terms.contact_gravity + paper_contact_force,
+        projected_gamma,
+    )
+
+
+def test_contact_space_dynamics_and_fixed_contact_force_shapes(model: FloatingBaseDynamics) -> None:
+    assert model.contact_model is not None
+    x = model.neutral_state()
+    active_contacts = torch.zeros(model.contact_model.num_contacts, dtype=torch.bool)
+    active_contacts[:2] = True
+
+    terms = model.contact_space_dynamics(x, active_contacts=active_contacts)
+    result = model.fixed_contact_forces_from_joint_torques(
+        x,
+        torch.zeros(model.n_joints, dtype=model.dtype),
+        active_contacts=active_contacts,
+    )
+
+    assert terms.contact_jacobian.shape == (6, model.nv)
+    assert terms.contact_jacobian_dot.shape == (6, model.nv)
+    assert terms.contact_inertia.shape == (6, 6)
+    assert terms.dynamic_inverse.shape == (model.nv, 6)
+    assert terms.contact_bias.shape == (6,)
+    assert terms.contact_gravity.shape == (6,)
+    assert terms.jacobian_dot_velocity.shape == (6,)
+    assert terms.contact_velocity.shape == (6,)
+    assert terms.active_contacts.shape == (model.contact_model.num_contacts,)
+    assert terms.singular_values.shape == (6,)
+    assert int(terms.rank.item()) <= 6
+    assert result.forces.shape == (model.contact_model.num_contacts, 3)
+    assert result.world_forces.shape == (model.contact_model.num_contacts, 3)
+    assert result.normal_forces.shape == (model.contact_model.num_contacts,)
+    assert torch.allclose(result.world_forces[~active_contacts], torch.zeros_like(result.world_forces[~active_contacts]))
+    assert torch.allclose(result.equation_residual, torch.zeros_like(result.equation_residual), atol=1e-9)
+    assert torch.isfinite(result.world_forces).all()
+
+
+def test_fixed_contact_forces_support_batches_frames_and_signs(model: FloatingBaseDynamics) -> None:
+    assert model.contact_model is not None
+    x0 = model.neutral_state()
+    x1 = x0.clone()
+    x1[0] = 0.05
+    x = torch.stack((x0, x1))
+    active_contacts = torch.zeros(model.contact_model.num_contacts, dtype=torch.bool)
+    active_contacts[::2] = True
+    torques = torch.zeros(2, model.n_joints, dtype=model.dtype)
+
+    env = model.fixed_contact_forces_from_joint_torques(x, torques, active_contacts=active_contacts)
+    robot = model.fixed_contact_forces_from_joint_torques(
+        x,
+        torques,
+        active_contacts=active_contacts,
+        force_direction="robot_on_environment",
+    )
+    contact_frame = model.fixed_contact_forces_from_joint_torques(
+        x0,
+        torques[0],
+        active_contacts=active_contacts,
+        force_frame="contact",
+    )
+
+    assert env.world_forces.shape == (2, model.contact_model.num_contacts, 3)
+    assert env.contact_space_dynamics.contact_jacobian.shape == (2, 12, model.nv)
+    assert torch.allclose(env.world_forces, -robot.world_forces, atol=1e-9)
+    assert contact_frame.force_frame == "contact"
+    with pytest.raises(ValueError, match="same contacts"):
+        changing_mask = torch.stack((active_contacts, ~active_contacts))
+        model.contact_space_dynamics(x, active_contacts=changing_mask)
+    with pytest.raises(ValueError, match="joint torque dimension"):
+        model.fixed_contact_forces_from_joint_torques(x0, torch.zeros(model.n_joints + 1, dtype=model.dtype))
+
+
+def test_fixed_contact_assumption_residuals_are_reported(model: FloatingBaseDynamics) -> None:
+    assert model.contact_model is not None
+    x = model.neutral_state()
+    x[model.nq + 6 :] = 0.02 * torch.sin(torch.arange(model.n_joints, dtype=model.dtype))
+    terms = model.contact_space_dynamics(x)
+    manual_velocity = torch.matmul(terms.contact_jacobian, x[model.nq :].unsqueeze(-1)).squeeze(-1)
+    manual_acceleration_residual = terms.jacobian_dot_velocity
+
+    assert torch.allclose(terms.contact_velocity, manual_velocity)
+    assert torch.allclose(terms.jacobian_dot_velocity, manual_acceleration_residual)
+    assert torch.linalg.norm(terms.contact_velocity) > 0.0
 
 
 def test_split_state_and_constructor_validation() -> None:

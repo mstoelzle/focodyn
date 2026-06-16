@@ -62,6 +62,84 @@ class DynamicsTerms:
     bias: torch.Tensor
 
 
+@dataclass(frozen=True)
+class ContactSpaceDynamicsTerms:
+    """Contact-space dynamics terms for the active contact set.
+
+    The terms follow the contact-space model
+    ``Lambda_c nu_dot_c + mu_c + p_c + f_c = Jbar_c.T Gamma``.
+    They are useful both for fixed-contact force estimation and for diagnosing
+    whether the fixed-contact assumptions are plausible for a trajectory.
+
+    Attributes:
+        contact_jacobian: Active translational contact Jacobian ``J_c`` with
+            shape ``(..., 3 * n_active, nv)``.
+        contact_jacobian_dot: Time derivative of ``J_c`` with shape
+            ``(..., 3 * n_active, nv)``.
+        contact_inertia: Contact-space inertia ``Lambda_c`` with shape
+            ``(..., 3 * n_active, 3 * n_active)``.
+        contact_bias: Contact-space Coriolis/centrifugal term ``mu_c`` with
+            shape ``(..., 3 * n_active)``.
+        contact_gravity: Contact-space gravity term ``p_c`` with shape
+            ``(..., 3 * n_active)``.
+        dynamic_inverse: Dynamically consistent inverse ``Jbar_c`` with shape
+            ``(..., nv, 3 * n_active)``.
+        jacobian_dot_velocity: Product ``Jdot_c(q, nu) nu`` with shape
+            ``(..., 3 * n_active)``.
+        contact_velocity: Product ``J_c(q) nu`` with shape
+            ``(..., 3 * n_active)``.
+        active_contacts: Boolean mask over the model's configured contacts
+            with shape ``(..., num_contacts)``.
+        rank: Numerical rank of ``J_c M^-1 J_c.T`` with shape ``(...)``.
+        singular_values: Singular values of ``J_c M^-1 J_c.T`` with shape
+            ``(..., min(3 * n_active, 3 * n_active))``.
+    """
+
+    contact_jacobian: torch.Tensor
+    contact_jacobian_dot: torch.Tensor
+    contact_inertia: torch.Tensor
+    contact_bias: torch.Tensor
+    contact_gravity: torch.Tensor
+    dynamic_inverse: torch.Tensor
+    jacobian_dot_velocity: torch.Tensor
+    contact_velocity: torch.Tensor
+    active_contacts: torch.Tensor
+    rank: torch.Tensor
+    singular_values: torch.Tensor
+
+
+@dataclass(frozen=True)
+class FixedContactForces:
+    """Fixed-contact force estimate and diagnostics.
+
+    Attributes:
+        forces: Contact forces in ``force_frame`` with shape
+            ``(..., num_contacts, 3)``. Inactive contacts are zero.
+        world_forces: Same forces expressed in the world frame with shape
+            ``(..., num_contacts, 3)``.
+        normal_forces: Force components along each contact frame's positive
+            z-axis with shape ``(..., num_contacts)``.
+        force_frame: Coordinate frame used by ``forces``.
+        force_direction: Physical sign convention used by the returned forces.
+            ``"environment_on_robot"`` matches this package's dynamics
+            convention ``M nu_dot + h = S.T tau + J.T lambda``.
+        active_contacts: Boolean mask over configured contacts with shape
+            ``(..., num_contacts)``.
+        contact_space_dynamics: Contact-space terms used for the estimate.
+        equation_residual: Residual of the fixed-contact Eq. (30) solve in the
+            paper's sign convention, with shape ``(..., 3 * n_active)``.
+    """
+
+    forces: torch.Tensor
+    world_forces: torch.Tensor
+    normal_forces: torch.Tensor
+    force_frame: Literal["world", "contact"]
+    force_direction: Literal["environment_on_robot", "robot_on_environment"]
+    active_contacts: torch.Tensor
+    contact_space_dynamics: ContactSpaceDynamicsTerms
+    equation_residual: torch.Tensor
+
+
 class FloatingBaseDynamics(torch.nn.Module):
     r"""Control-affine differentiable floating-base dynamics.
 
@@ -463,6 +541,252 @@ class FloatingBaseDynamics(torch.nn.Module):
         generalized_force = torch.matmul(matrix, inputs.unsqueeze(-1)).squeeze(-1)
         return generalized_force.squeeze(0) if split.was_single else generalized_force
 
+    def contact_space_dynamics(
+        self,
+        x: torch.Tensor,
+        *,
+        active_contacts: torch.Tensor | None = None,
+        pinv_rcond: float = 1e-10,
+    ) -> ContactSpaceDynamicsTerms:
+        """Return contact-space dynamics terms for the active contacts.
+
+        This computes the ingredients of the contact-space dynamics
+        ``Lambda_c nu_dot_c + mu_c + p_c + f_c = Jbar_c.T Gamma`` using the
+        same mass, Coriolis, gravity, and contact-Jacobian conventions as the
+        rest of this module. The returned ``contact_velocity`` and
+        ``jacobian_dot_velocity`` fields are diagnostics for the fixed-contact
+        assumptions used by :meth:`fixed_contact_forces_from_generalized_force`.
+
+        Args:
+            x: State tensor with shape ``(state_dim,)`` or
+                ``(batch, state_dim)``.
+            active_contacts: Optional boolean mask selecting contacts to keep.
+                Shape is ``(num_contacts,)`` or ``(batch, num_contacts)``. For
+                batched states, every batch entry must select the same contact
+                set because the reduced contact-space dimension must be common.
+                ``None`` selects every configured contact.
+            pinv_rcond: Relative cutoff used by ``torch.linalg.pinv`` when
+                inverting ``J_c M^-1 J_c.T``.
+
+        Returns:
+            :class:`ContactSpaceDynamicsTerms` with active contact rows only.
+
+        Raises:
+            RuntimeError: If this model was constructed without contact forces.
+            ValueError: If ``active_contacts`` has an invalid shape or selects
+                different contacts across a batch.
+        """
+        if self.contact_model is None:
+            raise RuntimeError("contact_space_dynamics requires include_contact_forces=True.")
+
+        split = self.split_state(x)
+        batch = split.base_position.shape[0]
+        base_transform = make_transform(split.base_position, split.base_quaternion_wxyz)
+        mass = self.kindyn.mass_matrix(base_transform, split.joint_positions)
+        coriolis = self.kindyn.coriolis_term(
+            base_transform,
+            split.joint_positions,
+            split.base_velocity,
+            split.joint_velocities,
+        )
+        gravity = self.kindyn.gravity_term(base_transform, split.joint_positions)
+        full_jacobian = self.contact_model.contact_jacobian(base_transform, split.joint_positions)
+        full_jacobian_dot = self.contact_model.contact_jacobian_dot(
+            base_transform,
+            split.joint_positions,
+            split.base_velocity,
+            split.joint_velocities,
+        )
+        active_mask, row_indices = self._active_contact_rows(active_contacts, batch_size=batch)
+        contact_jacobian = torch.index_select(full_jacobian, dim=-2, index=row_indices)
+        contact_jacobian_dot = torch.index_select(full_jacobian_dot, dim=-2, index=row_indices)
+        generalized_velocity = torch.cat((split.base_velocity, split.joint_velocities), dim=-1)
+        terms = _contact_space_dynamics_from_matrices(
+            mass_matrix=mass,
+            coriolis=coriolis,
+            gravity=gravity,
+            contact_jacobian=contact_jacobian,
+            contact_jacobian_dot=contact_jacobian_dot,
+            generalized_velocity=generalized_velocity,
+            active_contacts=active_mask,
+            pinv_rcond=pinv_rcond,
+        )
+        return _squeeze_contact_space_terms(terms) if split.was_single else terms
+
+    def fixed_contact_forces_from_generalized_force(
+        self,
+        x: torch.Tensor,
+        generalized_force: torch.Tensor,
+        *,
+        active_contacts: torch.Tensor | None = None,
+        force_frame: Literal["world", "contact"] = "world",
+        force_direction: Literal["environment_on_robot", "robot_on_environment"] = "environment_on_robot",
+        pinv_rcond: float = 1e-10,
+    ) -> FixedContactForces:
+        r"""Estimate contact forces under fixed-contact assumptions.
+
+        This is the package-convention equivalent of Eq. (30) in the attached
+        paper. It assumes the selected contacts are sticking/fixed:
+        ``J_c(q) nu = 0`` and
+        ``J_c(q) nu_dot + Jdot_c(q, nu) nu = 0``. The method reports
+        ``contact_velocity`` and ``jacobian_dot_velocity`` in
+        :meth:`contact_space_dynamics`, but it does not make sliding,
+        impact, or contact-transition forces valid.
+
+        Args:
+            x: State tensor with shape ``(state_dim,)`` or
+                ``(batch, state_dim)``.
+            generalized_force: Generalized right-hand-side force ``Gamma``
+                with shape ``(nv,)`` or ``(batch, nv)``. For actuated torques,
+                use :meth:`fixed_contact_forces_from_joint_torques`.
+            active_contacts: Optional boolean mask selecting fixed contacts.
+            force_frame: ``"world"`` to return force vectors in world
+                coordinates or ``"contact"`` to return each force in its
+                contact frame.
+            force_direction: ``"environment_on_robot"`` returns the contact
+                force sign used by this package's dynamics,
+                ``M nu_dot + h = S.T tau + J.T lambda``. The paper's
+                ``f_c`` sign is available as ``"robot_on_environment"``.
+            pinv_rcond: Relative cutoff for rank-deficient contact-space
+                inertia pseudoinversion.
+
+        Returns:
+            :class:`FixedContactForces`. Inactive contacts are represented by
+            zero force rows.
+
+        Raises:
+            RuntimeError: If this model was constructed without contact forces.
+            ValueError: If dimensions or frame/sign options are invalid.
+        """
+        if self.contact_model is None:
+            raise RuntimeError(
+                "fixed_contact_forces_from_generalized_force requires include_contact_forces=True."
+            )
+        if force_frame not in {"world", "contact"}:
+            raise ValueError("force_frame must be 'world' or 'contact'.")
+        if force_direction not in {"environment_on_robot", "robot_on_environment"}:
+            raise ValueError("force_direction must be 'environment_on_robot' or 'robot_on_environment'.")
+
+        split = self.split_state(x)
+        batch = split.base_position.shape[0]
+        forces_rhs = generalized_force.to(dtype=self.dtype, device=self.device)
+        if forces_rhs.shape[-1] != self.nv:
+            raise ValueError(f"Expected generalized force dimension {self.nv}.")
+        if forces_rhs.ndim == 1:
+            forces_rhs = forces_rhs.unsqueeze(0).expand(batch, self.nv)
+        if forces_rhs.shape[0] != batch:
+            raise ValueError(f"Expected generalized force batch dimension {batch}.")
+
+        terms = self.contact_space_dynamics(
+            x,
+            active_contacts=active_contacts,
+            pinv_rcond=pinv_rcond,
+        )
+        batched_terms = _unsqueeze_contact_space_terms(terms) if split.was_single else terms
+        projected_force = torch.matmul(
+            batched_terms.dynamic_inverse.transpose(-1, -2),
+            forces_rhs.unsqueeze(-1),
+        ).squeeze(-1)
+        robot_on_environment = projected_force - batched_terms.contact_bias - batched_terms.contact_gravity
+        equation_residual = (
+            batched_terms.contact_bias
+            + batched_terms.contact_gravity
+            + robot_on_environment
+            - projected_force
+        )
+        if force_direction == "environment_on_robot":
+            active_world_vector = -robot_on_environment
+        else:
+            active_world_vector = robot_on_environment
+
+        active_world_forces = active_world_vector.reshape(batch, -1, 3)
+        world_forces = torch.zeros(
+            batch,
+            self.contact_model.num_contacts,
+            3,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        contact_indices = torch.nonzero(batched_terms.active_contacts[0], as_tuple=False).flatten()
+        if contact_indices.numel() > 0:
+            world_forces[:, contact_indices, :] = active_world_forces
+
+        base_transform = make_transform(split.base_position, split.base_quaternion_wxyz)
+        contact_poses = self.contact_model.contact_poses(base_transform, split.joint_positions)
+        rotations = contact_poses.transforms[..., :3, :3].to(dtype=self.dtype, device=self.device)
+        if force_frame == "world":
+            forces = world_forces
+        else:
+            forces = torch.matmul(rotations.transpose(-1, -2), world_forces.unsqueeze(-1)).squeeze(-1)
+        normals = rotations[..., :, 2]
+        normal_forces = torch.sum(world_forces * normals, dim=-1)
+
+        result = FixedContactForces(
+            forces=forces,
+            world_forces=world_forces,
+            normal_forces=normal_forces,
+            force_frame=force_frame,
+            force_direction=force_direction,
+            active_contacts=batched_terms.active_contacts,
+            contact_space_dynamics=batched_terms,
+            equation_residual=equation_residual,
+        )
+        return _squeeze_fixed_contact_forces(result) if split.was_single else result
+
+    def fixed_contact_forces_from_joint_torques(
+        self,
+        x: torch.Tensor,
+        joint_torques: torch.Tensor,
+        *,
+        active_contacts: torch.Tensor | None = None,
+        force_frame: Literal["world", "contact"] = "world",
+        force_direction: Literal["environment_on_robot", "robot_on_environment"] = "environment_on_robot",
+        pinv_rcond: float = 1e-10,
+    ) -> FixedContactForces:
+        """Estimate fixed-contact forces from actuated joint torques.
+
+        This convenience wrapper maps joint torques through ``S.T`` and then
+        calls :meth:`fixed_contact_forces_from_generalized_force`. It has the
+        same fixed-contact assumptions: ``J_c(q) nu = 0`` and
+        ``J_c(q) nu_dot + Jdot_c(q, nu) nu = 0`` for the selected contacts.
+
+        Args:
+            x: State tensor with shape ``(state_dim,)`` or
+                ``(batch, state_dim)``.
+            joint_torques: Actuated torque vector with shape ``(n_joints,)``
+                or ``(batch, n_joints)``.
+            active_contacts: Optional boolean mask selecting fixed contacts.
+            force_frame: Coordinate frame for returned force vectors.
+            force_direction: Physical sign convention for returned forces.
+            pinv_rcond: Relative cutoff for rank-deficient contact-space
+                inertia pseudoinversion.
+
+        Returns:
+            :class:`FixedContactForces`.
+
+        Raises:
+            ValueError: If ``joint_torques`` has the wrong trailing dimension.
+        """
+        split = self.split_state(x)
+        batch = split.base_position.shape[0]
+        torques = joint_torques.to(dtype=self.dtype, device=self.device)
+        if torques.shape[-1] != self.n_joints:
+            raise ValueError(f"Expected joint torque dimension {self.n_joints}.")
+        if torques.ndim == 1:
+            torques = torques.unsqueeze(0).expand(batch, self.n_joints)
+        if torques.shape[0] != batch:
+            raise ValueError(f"Expected joint torque batch dimension {batch}.")
+        selection = self.selection_matrix_transpose(batch_size=batch)
+        generalized_force = torch.matmul(selection, torques.unsqueeze(-1)).squeeze(-1)
+        return self.fixed_contact_forces_from_generalized_force(
+            x,
+            generalized_force,
+            active_contacts=active_contacts,
+            force_frame=force_frame,
+            force_direction=force_direction,
+            pinv_rcond=pinv_rcond,
+        )
+
     def forward(self, x: torch.Tensor, u: torch.Tensor | None = None) -> torch.Tensor:
         """Evaluate the control-affine dynamics.
 
@@ -499,6 +823,46 @@ class FloatingBaseDynamics(torch.nn.Module):
         if batch_size is None:
             return selection
         return selection.expand(batch_size, self.nv, self.n_joints)
+
+    def _active_contact_rows(
+        self,
+        active_contacts: torch.Tensor | None,
+        *,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize an active-contact mask and return matching Jacobian rows."""
+        if self.contact_model is None:
+            raise RuntimeError("Active contact rows require a contact model.")
+        num_contacts = self.contact_model.num_contacts
+        if active_contacts is None:
+            mask = torch.ones(batch_size, num_contacts, dtype=torch.bool, device=self.device)
+        else:
+            mask = torch.as_tensor(active_contacts, dtype=torch.bool, device=self.device)
+            if mask.ndim == 1:
+                if mask.shape[0] != num_contacts:
+                    raise ValueError(f"Expected active_contacts shape ({num_contacts},).")
+                mask = mask.unsqueeze(0).expand(batch_size, num_contacts)
+            elif mask.ndim == 2:
+                if mask.shape != (batch_size, num_contacts):
+                    raise ValueError(
+                        f"Expected active_contacts shape ({batch_size}, {num_contacts})."
+                    )
+            else:
+                raise ValueError("active_contacts must have shape (num_contacts,) or (batch, num_contacts).")
+
+        if batch_size > 1 and not torch.equal(mask, mask[:1].expand_as(mask)):
+            raise ValueError(
+                "Batched active_contacts must select the same contacts for every batch entry; "
+                "call contact_space_dynamics per frame for changing contact sets."
+            )
+
+        contact_indices = torch.nonzero(mask[0], as_tuple=False).flatten()
+        if contact_indices.numel() == 0:
+            row_indices = torch.empty(0, dtype=torch.long, device=self.device)
+        else:
+            local_rows = torch.arange(3, dtype=torch.long, device=self.device)
+            row_indices = (3 * contact_indices.unsqueeze(-1) + local_rows).reshape(-1)
+        return mask, row_indices
 
     def _configuration_derivative(self, split: SplitState) -> torch.Tensor:
         """Compute ``q_dot`` from a split state.
@@ -611,6 +975,150 @@ class FloatingBaseDynamics(torch.nn.Module):
         )
         contact_map = torch.matmul(contact_jacobian.transpose(-1, -2), force_transform)
         return torch.cat((torque_map, contact_map), dim=-1)
+
+
+def _contact_space_dynamics_from_matrices(
+    *,
+    mass_matrix: torch.Tensor,
+    coriolis: torch.Tensor,
+    gravity: torch.Tensor,
+    contact_jacobian: torch.Tensor,
+    contact_jacobian_dot: torch.Tensor,
+    generalized_velocity: torch.Tensor,
+    active_contacts: torch.Tensor,
+    pinv_rcond: float,
+) -> ContactSpaceDynamicsTerms:
+    """Build contact-space dynamics terms from joint-space matrices.
+
+    This helper is intentionally matrix-only so tests can verify the
+    contact-space algebra independently of Adam.
+    """
+    contact_dim = contact_jacobian.shape[-2]
+    if contact_dim == 0:
+        batch_shape = mass_matrix.shape[:-2]
+        nv = mass_matrix.shape[-1]
+        empty_vector = torch.empty(*batch_shape, 0, dtype=mass_matrix.dtype, device=mass_matrix.device)
+        empty_contact_matrix = torch.empty(
+            *batch_shape,
+            0,
+            0,
+            dtype=mass_matrix.dtype,
+            device=mass_matrix.device,
+        )
+        empty_dynamic_inverse = torch.empty(
+            *batch_shape,
+            nv,
+            0,
+            dtype=mass_matrix.dtype,
+            device=mass_matrix.device,
+        )
+        rank = torch.zeros(*batch_shape, dtype=torch.long, device=mass_matrix.device)
+        return ContactSpaceDynamicsTerms(
+            contact_jacobian=contact_jacobian,
+            contact_jacobian_dot=contact_jacobian_dot,
+            contact_inertia=empty_contact_matrix,
+            contact_bias=empty_vector,
+            contact_gravity=empty_vector,
+            dynamic_inverse=empty_dynamic_inverse,
+            jacobian_dot_velocity=empty_vector,
+            contact_velocity=empty_vector,
+            active_contacts=active_contacts,
+            rank=rank,
+            singular_values=empty_vector,
+        )
+
+    mass_inverse_jacobian_transpose = torch.linalg.solve(
+        mass_matrix,
+        contact_jacobian.transpose(-1, -2),
+    )
+    inverse_contact_inertia = torch.matmul(contact_jacobian, mass_inverse_jacobian_transpose)
+    contact_inertia = torch.linalg.pinv(inverse_contact_inertia, rtol=float(pinv_rcond))
+    dynamic_inverse = torch.matmul(mass_inverse_jacobian_transpose, contact_inertia)
+
+    jacobian_dot_velocity = torch.matmul(
+        contact_jacobian_dot,
+        generalized_velocity.unsqueeze(-1),
+    ).squeeze(-1)
+    contact_velocity = torch.matmul(contact_jacobian, generalized_velocity.unsqueeze(-1)).squeeze(-1)
+    jdot_bias = -torch.matmul(contact_inertia, jacobian_dot_velocity.unsqueeze(-1)).squeeze(-1)
+    contact_bias = (
+        torch.matmul(dynamic_inverse.transpose(-1, -2), coriolis.unsqueeze(-1)).squeeze(-1)
+        + jdot_bias
+    )
+    contact_gravity = torch.matmul(
+        dynamic_inverse.transpose(-1, -2),
+        gravity.unsqueeze(-1),
+    ).squeeze(-1)
+
+    singular_values = torch.linalg.svdvals(inverse_contact_inertia)
+    tolerance = (
+        float(pinv_rcond)
+        * max(inverse_contact_inertia.shape[-2], inverse_contact_inertia.shape[-1])
+        * singular_values[..., :1]
+    )
+    rank = torch.sum(singular_values > tolerance, dim=-1)
+
+    return ContactSpaceDynamicsTerms(
+        contact_jacobian=contact_jacobian,
+        contact_jacobian_dot=contact_jacobian_dot,
+        contact_inertia=contact_inertia,
+        contact_bias=contact_bias,
+        contact_gravity=contact_gravity,
+        dynamic_inverse=dynamic_inverse,
+        jacobian_dot_velocity=jacobian_dot_velocity,
+        contact_velocity=contact_velocity,
+        active_contacts=active_contacts,
+        rank=rank,
+        singular_values=singular_values,
+    )
+
+
+def _squeeze_contact_space_terms(terms: ContactSpaceDynamicsTerms) -> ContactSpaceDynamicsTerms:
+    """Remove the leading batch dimension from contact-space terms."""
+    return ContactSpaceDynamicsTerms(
+        contact_jacobian=terms.contact_jacobian.squeeze(0),
+        contact_jacobian_dot=terms.contact_jacobian_dot.squeeze(0),
+        contact_inertia=terms.contact_inertia.squeeze(0),
+        contact_bias=terms.contact_bias.squeeze(0),
+        contact_gravity=terms.contact_gravity.squeeze(0),
+        dynamic_inverse=terms.dynamic_inverse.squeeze(0),
+        jacobian_dot_velocity=terms.jacobian_dot_velocity.squeeze(0),
+        contact_velocity=terms.contact_velocity.squeeze(0),
+        active_contacts=terms.active_contacts.squeeze(0),
+        rank=terms.rank.squeeze(0),
+        singular_values=terms.singular_values.squeeze(0),
+    )
+
+
+def _unsqueeze_contact_space_terms(terms: ContactSpaceDynamicsTerms) -> ContactSpaceDynamicsTerms:
+    """Add a leading batch dimension to contact-space terms."""
+    return ContactSpaceDynamicsTerms(
+        contact_jacobian=terms.contact_jacobian.unsqueeze(0),
+        contact_jacobian_dot=terms.contact_jacobian_dot.unsqueeze(0),
+        contact_inertia=terms.contact_inertia.unsqueeze(0),
+        contact_bias=terms.contact_bias.unsqueeze(0),
+        contact_gravity=terms.contact_gravity.unsqueeze(0),
+        dynamic_inverse=terms.dynamic_inverse.unsqueeze(0),
+        jacobian_dot_velocity=terms.jacobian_dot_velocity.unsqueeze(0),
+        contact_velocity=terms.contact_velocity.unsqueeze(0),
+        active_contacts=terms.active_contacts.unsqueeze(0),
+        rank=terms.rank.unsqueeze(0),
+        singular_values=terms.singular_values.unsqueeze(0),
+    )
+
+
+def _squeeze_fixed_contact_forces(result: FixedContactForces) -> FixedContactForces:
+    """Remove the leading batch dimension from fixed-contact force outputs."""
+    return FixedContactForces(
+        forces=result.forces.squeeze(0),
+        world_forces=result.world_forces.squeeze(0),
+        normal_forces=result.normal_forces.squeeze(0),
+        force_frame=result.force_frame,
+        force_direction=result.force_direction,
+        active_contacts=result.active_contacts.squeeze(0),
+        contact_space_dynamics=_squeeze_contact_space_terms(result.contact_space_dynamics),
+        equation_residual=result.equation_residual.squeeze(0),
+    )
 
 
 def _build_adam_kindyn(asset: RobotAsset, dtype: torch.dtype, device: torch.device):

@@ -128,6 +128,17 @@ distances, penetration depths, world normals, and binary contact flags.
 debugging and visualization. It returns forces in the world frame by default,
 or in each local contact frame with `force_frame="contact"`.
 
+`FloatingBaseDynamics.contact_space_dynamics(...)` computes the contact-space
+terms used by the fixed-contact model: contact inertia, bias, gravity,
+dynamically consistent inverse, `Jdot @ nu`, and rank/conditioning
+diagnostics. `fixed_contact_forces_from_generalized_force(...)` and
+`fixed_contact_forces_from_joint_torques(...)` estimate contact forces under
+the sticking-contact assumptions `J_c(q) nu = 0` and
+`J_c(q) nu_dot + Jdot_c(q, nu) nu = 0`. These methods return forces in this
+package's convention, i.e. contact forces applied to the robot in
+`M(q) nu_dot + h(q, nu) = S^T tau + J_c(q)^T lambda`. They are not impact,
+sliding-contact, or contact-transition solvers.
+
 ## Motion Derivatives
 
 Kinematic references can be differentiated with `torch-dxdt` Whittaker-Eilers
@@ -137,6 +148,31 @@ velocities, and accelerations:
 
 ```bash
 uv run --extra viz python examples/plot_g1_motion_derivatives.py --lambdas 10 100 1000 10000 --output outputs/motion_derivative_lambdas.pdf
+```
+
+To analyze fixed-contact forces along the bundled kinematic trajectory and
+save contact-force diagnostic plots:
+
+```bash
+uv run --extra viz focodyn-analyze-fixed-contact-forces --output-dir outputs/contact_forces
+```
+
+The default `feet_corners` contact mode uses the four small sphere collision
+origins on each G1 ankle-roll link as point contacts. These are plotted as
+left/right heel and toe points at negative/positive local foot `y`. The summary
+PDF shades friction-ratio values above the Coulomb limit
+`rho = ||f_t|| / (mu f_n) > 1` and negative normal forces `f_n < 0`; the
+contact-height panel also marks the signed-distance threshold used to activate
+contacts. To also export a Viser-rendered MP4 with the estimated contact-force
+arrows overlaid on the kinematic motion, add:
+
+```bash
+uv run --extra viz focodyn-analyze-fixed-contact-forces \
+  --output-dir outputs/contact_forces \
+  --export-video outputs/contact_forces/fixed_contact_forces.mp4 \
+  --export-frames 120 \
+  --video-force-scale 0.01 \
+  --port 0
 ```
 
 ## Visualization
