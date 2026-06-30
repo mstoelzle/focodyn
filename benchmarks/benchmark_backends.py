@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import statistics
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,8 @@ import numpy as np
 from focodyn.assets import RobotAsset
 from focodyn.assets import load_asset
 
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 IMPLEMENTATIONS = ("adam-torch", "adam-jax", "frax")
 QUERIES = ("jacobian", "forward-dynamics", "forward-dynamics-no-coriolis")
@@ -563,13 +567,14 @@ def _make_adam_jax_runner(
 
     device = _jax_device(jax, device_name, "Adam JAX")
     dtype = jnp.float64 if dtype_name == "float64" else jnp.float32
-    gravity = jnp.asarray(GRAVITY, dtype=dtype)
-    kindyn = KinDynComputations(
-        str(payload.asset.adam_urdf_path),
-        list(payload.asset.joint_names),
-        dtype=dtype,
-        gravity=gravity,
-    )
+    with _jax_default_device(jax, device):
+        gravity = jnp.asarray(GRAVITY, dtype=dtype)
+        kindyn = KinDynComputations(
+            str(payload.asset.adam_urdf_path),
+            list(payload.asset.joint_names),
+            dtype=dtype,
+            gravity=gravity,
+        )
     kindyn.set_frame_velocity_representation(adam.Representations.MIXED_REPRESENTATION)
 
     if mode == "single-cpu":
@@ -633,13 +638,14 @@ def _make_adam_jax_runner(
         raise ValueError(f"Unknown query {query!r}")
 
     if mode == "single-cpu":
-        kernel = jax.jit(single_kernel)
+        kernel = jax.jit(single_kernel, device=device)
     else:
         kernel = jax.jit(
             lambda transforms, positions, base_velocities, joint_velocities_, torques: jax.lax.map(
                 lambda sample: single_kernel(*sample),
                 (transforms, positions, base_velocities, joint_velocities_, torques),
-            )
+            ),
+            device=device,
         )
 
     def run() -> Any:
@@ -806,8 +812,14 @@ def _jax_device(jax: Any, device_name: str, backend_name: str) -> Any:
     return devices[0]
 
 
-def _put_jax(jax: Any, jnp: Any, value: np.ndarray, dtype: Any, device: Any) -> Any:
-    return jax.device_put(jnp.asarray(value, dtype=dtype), device)
+def _put_jax(jax: Any, _jnp: Any, value: np.ndarray, dtype: Any, device: Any) -> Any:
+    return jax.device_put(np.asarray(value, dtype=np.dtype(dtype)), device)
+
+
+def _jax_default_device(jax: Any, device: Any) -> Any:
+    if hasattr(jax, "default_device"):
+        return jax.default_device(device)
+    return nullcontext()
 
 
 def _sync_jax(jax: Any, value: Any) -> None:
