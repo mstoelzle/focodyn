@@ -12,6 +12,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from dataclasses import dataclass
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 from typing import Callable
@@ -33,7 +34,11 @@ GRAVITY = np.array([0.0, 0.0, -9.80665, 0.0, 0.0, 0.0])
 BENCHMARK_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "outputs"
 DEFAULT_PDF_FILENAME = "benchmark-results.pdf"
+DEFAULT_JSON_FILENAME = "benchmark-results.json"
+DEFAULT_CSV_FILENAME = "benchmark-results.csv"
 DEFAULT_PDF_PATH = DEFAULT_OUTPUT_DIR / DEFAULT_PDF_FILENAME
+DEFAULT_JSON_PATH = DEFAULT_OUTPUT_DIR / DEFAULT_JSON_FILENAME
+DEFAULT_CSV_PATH = DEFAULT_OUTPUT_DIR / DEFAULT_CSV_FILENAME
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,9 @@ class BenchmarkRow:
     output_shape: str = ""
 
 
+BENCHMARK_FIELDNAMES = tuple(field.name for field in fields(BenchmarkRow))
+
+
 @dataclass(frozen=True)
 class BenchmarkRunner:
     run: Callable[[], Any]
@@ -114,10 +122,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=["all"],
         help=f"Devices to run: comma-separated/list values from {DEVICES}, or all.",
     )
-    parser.add_argument("--output-json", type=Path)
-    parser.add_argument("--output-csv", type=Path)
+    parser.add_argument(
+        "--input-json",
+        type=Path,
+        help="Load saved benchmark rows from JSON and regenerate outputs without running benchmarks.",
+    )
+    parser.add_argument(
+        "--input-csv",
+        type=Path,
+        help="Load saved benchmark rows from CSV and regenerate outputs without running benchmarks.",
+    )
+    parser.add_argument("--output-json", type=Path, default=DEFAULT_JSON_PATH)
+    parser.add_argument("--output-csv", type=Path, default=DEFAULT_CSV_PATH)
+    parser.add_argument("--output-pdf", type=Path, default=DEFAULT_PDF_PATH)
     parser.add_argument("--asset", default="unitree_g1")
     args = parser.parse_args(argv)
+    if args.input_json is not None and args.input_csv is not None:
+        parser.error("--input-json and --input-csv are mutually exclusive")
     args.implementations = _expand_selection(args.implementations, IMPLEMENTATIONS, "--implementations")
     args.queries = _expand_selection(args.queries, QUERIES, "--queries")
     args.devices = _expand_selection(args.devices, DEVICES, "--devices")
@@ -281,23 +302,83 @@ def make_payload(asset: RobotAsset, batch_size: int) -> BenchmarkPayload:
     )
 
 
+def read_rows_from_json(json_path: Path) -> list[BenchmarkRow]:
+    data = json.loads(json_path.read_text())
+    if not isinstance(data, list):
+        raise ValueError(f"Expected {json_path} to contain a JSON list of benchmark rows")
+    return [_row_from_mapping(item) for item in data]
+
+
+def read_rows_from_csv(csv_path: Path) -> list[BenchmarkRow]:
+    with csv_path.open(newline="") as csv_file:
+        return [_row_from_mapping(row) for row in csv.DictReader(csv_file)]
+
+
+def _row_from_mapping(mapping: Any) -> BenchmarkRow:
+    if not isinstance(mapping, dict):
+        raise ValueError("Benchmark rows must be objects")
+    return BenchmarkRow(
+        implementation=_string_value(mapping.get("implementation")),
+        query=_string_value(mapping.get("query")),
+        mode=_string_value(mapping.get("mode")),
+        device=_string_value(mapping.get("device")),
+        batch_size=_int_value(mapping.get("batch_size")),
+        dtype=_string_value(mapping.get("dtype")),
+        warmups=_int_value(mapping.get("warmups")),
+        iters=_int_value(mapping.get("iters")),
+        status=_string_value(mapping.get("status")),
+        reason=_string_value(mapping.get("reason")),
+        mean_ms=_optional_float(mapping.get("mean_ms")),
+        median_ms=_optional_float(mapping.get("median_ms")),
+        min_ms=_optional_float(mapping.get("min_ms")),
+        max_ms=_optional_float(mapping.get("max_ms")),
+        std_ms=_optional_float(mapping.get("std_ms")),
+        output_shape=_string_value(mapping.get("output_shape")),
+    )
+
+
+def _string_value(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _int_value(value: Any) -> int:
+    return int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def write_outputs(
     rows: list[BenchmarkRow],
     *,
     json_path: Path | None,
     csv_path: Path | None,
     pdf_path: Path | None,
-) -> None:
+) -> list[Path]:
     dictionaries = [asdict(row) for row in rows]
+    written_paths: list[Path] = []
     if json_path is not None:
+        _ensure_parent(json_path)
         json_path.write_text(json.dumps(dictionaries, indent=2) + "\n")
+        written_paths.append(json_path)
     if csv_path is not None:
+        _ensure_parent(csv_path)
         with csv_path.open("w", newline="") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=list(dictionaries[0]) if dictionaries else [])
+            writer = csv.DictWriter(csv_file, fieldnames=BENCHMARK_FIELDNAMES)
             writer.writeheader()
             writer.writerows(dictionaries)
+        written_paths.append(csv_path)
     if pdf_path is not None:
         write_pdf(rows, pdf_path)
+        written_paths.append(pdf_path)
+    return written_paths
 
 
 def write_pdf(rows: list[BenchmarkRow], pdf_path: Path) -> None:
@@ -320,22 +401,63 @@ def write_pdf(rows: list[BenchmarkRow], pdf_path: Path) -> None:
 
 
 def _write_pdf_summary_page(pdf: Any, plt: Any, rows: list[BenchmarkRow], ok_rows: list[BenchmarkRow]) -> None:
-    fig, ax = plt.subplots(figsize=(11.0, 8.5))
-    fig.suptitle("focodyn Backend Benchmark", fontsize=16, fontweight="bold", y=0.96)
+    query_groups = _ordered_queries(ok_rows)
+    if query_groups:
+        from matplotlib.patches import Patch
 
-    if ok_rows:
-        labels = [f"{row.implementation}\n{row.query}\n{row.mode}" for row in ok_rows]
-        values = [float(row.mean_ms) for row in ok_rows]
-        colors = [_implementation_color(row.implementation) for row in ok_rows]
-        ax.bar(range(len(ok_rows)), values, color=colors)
-        ax.set_ylabel("Mean latency (ms)")
-        ax.set_xticks(range(len(ok_rows)))
-        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
-        ax.grid(axis="y", alpha=0.25)
-        ax.set_axisbelow(True)
+        fig_height = max(6.5, 2.35 * len(query_groups) + 1.6)
+        fig, axes_grid = plt.subplots(len(query_groups), 1, figsize=(11.0, fig_height), squeeze=False)
+        axes = [axis for row in axes_grid for axis in row]
+        fig.suptitle("focodyn Backend Benchmark", fontsize=16, fontweight="bold", y=0.985)
+
+        implementations = _ordered_implementations(ok_rows)
+        mode_groups = _ordered_modes(ok_rows)
+        x_positions = np.arange(len(mode_groups))
+        bar_width = min(0.24, 0.78 / max(1, len(implementations)))
+        offsets = (np.arange(len(implementations)) - (len(implementations) - 1) / 2.0) * bar_width
+
+        for ax, query in zip(axes, query_groups):
+            query_rows = [row for row in ok_rows if row.query == query]
+            values_by_key = {
+                (row.implementation, row.mode): float(row.mean_ms)
+                for row in query_rows
+                if row.mean_ms is not None
+            }
+            for implementation_index, implementation in enumerate(implementations):
+                plotted_x: list[float] = []
+                plotted_values: list[float] = []
+                for mode_index, mode in enumerate(mode_groups):
+                    value = values_by_key.get((implementation, mode))
+                    if value is not None:
+                        plotted_x.append(float(x_positions[mode_index] + offsets[implementation_index]))
+                        plotted_values.append(value)
+                if plotted_values:
+                    ax.bar(
+                        plotted_x,
+                        plotted_values,
+                        width=bar_width * 0.92,
+                        color=_implementation_color(implementation),
+                    )
+            ax.set_title(_query_label(query), fontsize=11, fontweight="bold", loc="left", pad=8)
+            ax.set_ylabel("Mean ms")
+            ax.set_xticks(x_positions)
+            ax.set_xticklabels([_mode_label(mode) for mode in mode_groups], fontsize=9)
+            ax.grid(axis="y", alpha=0.25)
+            ax.set_axisbelow(True)
+            ax.margins(x=0.05)
+
+        legend_handles = [
+            Patch(facecolor=_implementation_color(implementation), label=_implementation_label(implementation))
+            for implementation in implementations
+        ]
+        fig.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=3, frameon=False)
+        tight_rect = (0.04, 0.07, 0.98, 0.91)
     else:
+        fig, ax = plt.subplots(figsize=(11.0, 8.5))
+        fig.suptitle("focodyn Backend Benchmark", fontsize=16, fontweight="bold", y=0.96)
         ax.text(0.5, 0.5, "No successful benchmark rows to plot.", ha="center", va="center", fontsize=14)
         ax.set_axis_off()
+        tight_rect = (0, 0.05, 1, 0.93)
 
     status_counts = {status: sum(row.status == status for row in rows) for status in ("ok", "skipped", "error")}
     fig.text(
@@ -347,7 +469,7 @@ def _write_pdf_summary_page(pdf: Any, plt: Any, rows: list[BenchmarkRow], ok_row
         ),
         fontsize=10,
     )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.93))
+    fig.tight_layout(rect=tight_rect)
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -365,7 +487,7 @@ def _write_pdf_table_pages(pdf: Any, plt: Any, rows: list[BenchmarkRow]) -> None
             row.output_shape,
             _shorten(row.reason, 54),
         ]
-        for row in rows
+        for row in _display_rows(rows)
     ]
     if not records:
         records = [["", "", "", "", "", "", "", "No benchmark rows."]]
@@ -404,7 +526,7 @@ def _write_pdf_table_pages(pdf: Any, plt: Any, rows: list[BenchmarkRow]) -> None
 def print_table(rows: list[BenchmarkRow]) -> None:
     headers = ("implementation", "query", "mode", "status", "mean_ms", "median_ms", "output", "reason")
     table = []
-    for row in rows:
+    for row in _display_rows(rows):
         table.append(
             (
                 row.implementation,
@@ -429,9 +551,16 @@ def print_table(rows: list[BenchmarkRow]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    rows = run_benchmarks(args)
+    if args.input_json is not None:
+        rows = read_rows_from_json(args.input_json)
+    elif args.input_csv is not None:
+        rows = read_rows_from_csv(args.input_csv)
+    else:
+        rows = run_benchmarks(args)
     print_table(rows)
-    write_outputs(rows, json_path=args.output_json, csv_path=args.output_csv, pdf_path=DEFAULT_PDF_PATH)
+    written_paths = write_outputs(rows, json_path=args.output_json, csv_path=args.output_csv, pdf_path=args.output_pdf)
+    for path in written_paths:
+        print(f"Wrote {path}")
     return 1 if any(row.status == "error" for row in rows) else 0
 
 
@@ -848,6 +977,69 @@ def _flatten_outputs(value: Any) -> list[Any]:
 
 def _format_number(value: float | None) -> str:
     return "" if value is None else f"{value:.3f}"
+
+
+def _display_rows(rows: list[BenchmarkRow]) -> list[BenchmarkRow]:
+    return sorted(rows, key=_display_sort_key)
+
+
+def _display_sort_key(row: BenchmarkRow) -> tuple[int, int, int, str]:
+    return (
+        _index_or_end(QUERIES, row.query),
+        _index_or_end(("single-cpu", "batched-cpu", "batched-gpu"), row.mode),
+        _index_or_end(IMPLEMENTATIONS, row.implementation),
+        row.device,
+    )
+
+
+def _ordered_queries(rows: list[BenchmarkRow]) -> list[str]:
+    return _ordered_unique((row.query for row in rows), QUERIES)
+
+
+def _ordered_implementations(rows: list[BenchmarkRow]) -> list[str]:
+    return _ordered_unique((row.implementation for row in rows), IMPLEMENTATIONS)
+
+
+def _ordered_modes(rows: list[BenchmarkRow]) -> list[str]:
+    return _ordered_unique((row.mode for row in rows), ("single-cpu", "batched-cpu", "batched-gpu"))
+
+
+def _ordered_unique(values: Any, preferred_order: tuple[str, ...]) -> list[str]:
+    seen = set(values)
+    ordered = [value for value in preferred_order if value in seen]
+    ordered.extend(sorted(value for value in seen if value not in preferred_order))
+    return ordered
+
+
+def _index_or_end(values: tuple[str, ...], value: str) -> int:
+    try:
+        return values.index(value)
+    except ValueError:
+        return len(values)
+
+
+def _query_label(query: str) -> str:
+    return {
+        "jacobian": "Kinematics / Jacobian",
+        "forward-dynamics": "Forward dynamics",
+        "forward-dynamics-no-coriolis": "Forward dynamics without Coriolis",
+    }.get(query, query)
+
+
+def _mode_label(mode: str) -> str:
+    return {
+        "single-cpu": "Single CPU",
+        "batched-cpu": "Batched CPU",
+        "batched-gpu": "Batched GPU",
+    }.get(mode, mode)
+
+
+def _implementation_label(implementation: str) -> str:
+    return {
+        "adam-torch": "Adam Torch",
+        "adam-jax": "Adam JAX",
+        "frax": "Frax",
+    }.get(implementation, implementation)
 
 
 def _implementation_color(implementation: str) -> str:
