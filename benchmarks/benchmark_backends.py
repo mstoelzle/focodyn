@@ -1,5 +1,5 @@
 # Example:
-# uv run --extra benchmark python benchmarks/benchmark_backends.py --devices cpu
+# uv run --extra benchmark python benchmarks/benchmark_backends.py
 from __future__ import annotations
 
 import argparse
