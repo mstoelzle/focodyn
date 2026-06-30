@@ -13,5 +13,8 @@ wheels/
 .uv-cache/
 .pytest_cache/
 
+# Generated benchmark reports
+benchmarks/outputs/
+
 # macOS
 .DS_Store

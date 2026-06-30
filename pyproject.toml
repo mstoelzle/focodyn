@@ -15,6 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+benchmark = [
+    "frax @ git+https://github.com/StanfordASL/frax.git",
+    "jax>=0.4",
+    "matplotlib>=3.8",
+]
 dev = [
     "coverage[toml]>=7.6",
     "pytest>=8.0",
