@@ -5,6 +5,7 @@ from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 
+from .joint_conventions import JointOrder, joint_names_for_order
 from .urdf import UrdfInfo, parse_urdf
 
 
@@ -19,9 +20,14 @@ class RobotAsset:
         root_link: Floating-base/root link name parsed from the URDF.
         joint_names: Ordered movable joint names. Tensor joint coordinates
             with shape ``(..., n_joints)`` use exactly this order.
+        joint_order: Convention used for ``joint_names``. ``"source"`` keeps
+            the URDF order; ``"unitree_g1_29dof"`` matches shared joints to
+            the Unitree 29-DoF convention.
         default_contact_links: Link names used for default foot contact
             geometry.
         urdf: Parsed URDF metadata.
+        usd_path: Optional path to the USD source from which the URDF
+            companions were generated.
     """
 
     name: str
@@ -31,6 +37,13 @@ class RobotAsset:
     joint_names: tuple[str, ...]
     default_contact_links: tuple[str, ...]
     urdf: UrdfInfo
+    usd_path: Path | None = None
+    joint_order: JointOrder = "source"
+
+    @property
+    def source_joint_names(self) -> tuple[str, ...]:
+        """Return movable joint names in source/companion URDF order."""
+        return self.urdf.joint_names
 
 
 _ASSET_VARIANTS = {
@@ -43,6 +56,11 @@ _ASSET_VARIANTS = {
     "g1_29dof_mode_14": "g1_29dof_mode_14.urdf",
     "g1_29dof_mode_15": "g1_29dof_mode_15.urdf",
     "g1_29dof_mode_16": "g1_29dof_mode_16.urdf",
+    "g1_37dof_minimal": "g1_37dof_minimal.urdf",
+}
+
+_ASSET_USD_VARIANTS = {
+    "g1_37dof_minimal": "g1_37dof_minimal.usd",
 }
 
 _UNITREE_G1_CONTACT_LINKS = ("left_ankle_roll_link", "right_ankle_roll_link")
@@ -61,26 +79,48 @@ def available_assets() -> tuple[str, ...]:
 
 
 @lru_cache(maxsize=None)
-def load_asset(asset_name: str = "unitree_g1") -> RobotAsset:
-    """Resolve a built-in asset alias or a direct URDF path.
+def load_asset(
+    asset_name: str = "unitree_g1", *, joint_order: JointOrder = "source"
+) -> RobotAsset:
+    """Resolve a built-in asset alias or a direct URDF/USD path.
 
     Args:
         asset_name: Built-in asset alias such as ``"unitree_g1"`` or a direct
-            path to a URDF file.
+            path to a URDF file. USD paths require same-stem generated URDF
+            companions.
+        joint_order: ``"source"`` preserves the movable-joint order of the
+            URDF (including a USD asset's companion URDF).
+            ``"unitree_g1_29dof"`` reorders shared G1 joints to match the
+            Unitree 29-DoF convention and appends source-only joints in their
+            original relative order.
 
     Returns:
         :class:`RobotAsset` with parsed root link, joint order, contact
-        links, original URDF path, and Adam-compatible URDF path.
+        links, source paths, and Adam-compatible URDF path.
 
     Raises:
         KeyError: If ``asset_name`` is neither a known alias nor an existing
             path.
-        ValueError: If the resolved URDF cannot be parsed.
+        ValueError: If the resolved URDF cannot be parsed or the requested
+            joint convention is invalid for the asset.
     """
     candidate = Path(asset_name).expanduser()
+    usd_path: Path | None = None
     if candidate.exists():
-        urdf_path = candidate.resolve()
-        canonical_name = urdf_path.stem
+        candidate = candidate.resolve()
+        canonical_name = candidate.stem
+        if candidate.suffix.lower() == ".usd":
+            usd_path = candidate
+            urdf_path = candidate.with_suffix(".urdf")
+            if not urdf_path.exists():
+                raise ValueError(
+                    f"USD asset {candidate} requires a same-stem URDF companion at {urdf_path}. "
+                    "Runtime USD conversion is not supported."
+                )
+        else:
+            urdf_path = candidate
+            sibling_usd = candidate.with_suffix(".usd")
+            usd_path = sibling_usd if sibling_usd.exists() else None
     else:
         if asset_name not in _ASSET_VARIANTS:
             raise KeyError(
@@ -95,19 +135,27 @@ def load_asset(asset_name: str = "unitree_g1") -> RobotAsset:
             / _ASSET_VARIANTS[asset_name]
         )
         urdf_path = Path(str(urdf_path))
+        usd_filename = _ASSET_USD_VARIANTS.get(asset_name)
+        if usd_filename is not None:
+            usd_path = urdf_path.with_name(usd_filename)
 
     info = parse_urdf(urdf_path)
+    joint_names = joint_names_for_order(info.joint_names, joint_order)
     contact_links = tuple(
-        link for link in _UNITREE_G1_CONTACT_LINKS if any(c.link_name == link for c in info.collisions)
+        link
+        for link in _UNITREE_G1_CONTACT_LINKS
+        if any(c.link_name == link for c in info.collisions)
     )
     return RobotAsset(
         name=canonical_name,
         urdf_path=urdf_path,
         adam_urdf_path=_adam_compatible_path(urdf_path),
         root_link=info.root_link,
-        joint_names=info.joint_names,
+        joint_names=joint_names,
         default_contact_links=contact_links,
         urdf=info,
+        usd_path=usd_path,
+        joint_order=joint_order,
     )
 
 

@@ -20,7 +20,9 @@ from focodyn.motion_derivatives import _order_value, _require_torch_dxdt
 
 
 def test_bundled_g1_motion_reference_loads() -> None:
-    model = FloatingBaseDynamics("unitree_g1", include_contact_forces=True, dtype=torch.float64)
+    model = FloatingBaseDynamics(
+        "unitree_g1", include_contact_forces=True, dtype=torch.float64
+    )
     motion = default_g1_motion_reference(model)
     assert motion.states.ndim == 2
     assert motion.states.shape[1] == model.state_dim
@@ -28,11 +30,15 @@ def test_bundled_g1_motion_reference_loads() -> None:
     assert motion.fps == 120.0
     assert motion.source_path.suffix == ".npy"
     assert torch.isfinite(motion.states).all()
-    assert torch.allclose(torch.linalg.norm(motion.states[:, 3:7], dim=-1), torch.ones_like(motion.times))
+    assert torch.allclose(
+        torch.linalg.norm(motion.states[:, 3:7], dim=-1), torch.ones_like(motion.times)
+    )
 
 
 def test_ember_g1_motion_reference_still_loads() -> None:
-    model = FloatingBaseDynamics("unitree_g1", include_contact_forces=True, dtype=torch.float64)
+    model = FloatingBaseDynamics(
+        "unitree_g1", include_contact_forces=True, dtype=torch.float64
+    )
     motion = load_kinematic_motion_reference(
         bundled_motion_reference_path(EMBER_G1_MOTION_REFERENCE),
         model,
@@ -40,6 +46,58 @@ def test_ember_g1_motion_reference_still_loads() -> None:
     assert motion.states.shape[1] == model.state_dim
     assert motion.fps == 30.0
     assert torch.isfinite(motion.states).all()
+
+
+@pytest.mark.parametrize(
+    "motion_name",
+    [None, EMBER_G1_MOTION_REFERENCE],
+    ids=["raw-npy", "named-npz"],
+)
+@pytest.mark.parametrize(
+    "joint_order", ["source", "unitree_g1_29dof"], ids=["source", "compatible"]
+)
+def test_bundled_g1_motions_map_to_37dof_minimal(
+    motion_name: str | None, joint_order: str
+) -> None:
+    source_model = FloatingBaseDynamics("unitree_g1", dtype=torch.float64)
+    target_model = FloatingBaseDynamics(
+        "g1_37dof_minimal", joint_order=joint_order, dtype=torch.float64
+    )
+    path = (
+        bundled_motion_reference_path(motion_name)
+        if motion_name
+        else bundled_motion_reference_path()
+    )
+    source = load_kinematic_motion_reference(path, source_model)
+    target = load_kinematic_motion_reference(path, target_model)
+
+    assert target.states.shape[1] == 87
+    assert torch.isfinite(target.states).all()
+    aliases = {
+        "torso_joint": "waist_yaw_joint",
+        "left_elbow_pitch_joint": "left_elbow_joint",
+        "left_elbow_roll_joint": "left_wrist_roll_joint",
+        "right_elbow_pitch_joint": "right_elbow_joint",
+        "right_elbow_roll_joint": "right_wrist_roll_joint",
+    }
+    for target_name in target_model.joint_names:
+        target_index = target_model.joint_names.index(target_name)
+        target_positions = target.states[:, 7 + target_index]
+        target_velocities = target.states[:, target_model.nq + 6 + target_index]
+        if any(
+            number in target_name
+            for number in ("zero", "one", "two", "three", "four", "five", "six")
+        ):
+            assert torch.count_nonzero(target_positions) == 0
+            assert torch.count_nonzero(target_velocities) == 0
+            continue
+        source_name = aliases.get(target_name, target_name)
+        source_index = source_model.joint_names.index(source_name)
+        assert torch.allclose(target_positions, source.states[:, 7 + source_index])
+        assert torch.allclose(
+            target_velocities,
+            source.states[:, source_model.nq + 6 + source_index],
+        )
 
 
 def test_bundled_g1_motion_has_knee_bend() -> None:
@@ -53,7 +111,9 @@ def test_bundled_g1_motion_has_knee_bend() -> None:
 
 
 def test_bundled_g1_motion_contact_heights_are_grounded() -> None:
-    model = FloatingBaseDynamics("unitree_g1", include_contact_forces=True, dtype=torch.float64)
+    model = FloatingBaseDynamics(
+        "unitree_g1", include_contact_forces=True, dtype=torch.float64
+    )
     assert model.contact_model is not None
     motion = default_g1_motion_reference(model)
     contact_heights = []
@@ -136,8 +196,12 @@ def test_whittaker_motion_derivative_estimate_shapes() -> None:
     assert estimate.configurations.shape == (states.shape[0], model.nq)
     assert estimate.configuration_velocities.shape == (states.shape[0], model.nv)
     assert estimate.configuration_accelerations.shape == (states.shape[0], model.nv)
-    assert torch.allclose(estimate.configuration_velocities, estimate.states[:, model.nq :])
-    assert torch.allclose(estimate.configuration_accelerations, estimate.generalized_accelerations)
+    assert torch.allclose(
+        estimate.configuration_velocities, estimate.states[:, model.nq :]
+    )
+    assert torch.allclose(
+        estimate.configuration_accelerations, estimate.generalized_accelerations
+    )
     assert torch.isfinite(estimate.states).all()
     assert torch.isfinite(estimate.generalized_accelerations).all()
     assert torch.allclose(
@@ -160,7 +224,9 @@ def test_motion_derivative_estimator_rejects_invalid_shapes() -> None:
         estimate_motion_derivatives(model, states[:3], times[:3])
 
 
-def test_motion_derivative_private_dependency_and_order_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_motion_derivative_private_dependency_and_order_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     real_import = builtins.__import__
 
     def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):

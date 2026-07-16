@@ -26,6 +26,7 @@ from .input_constraints import (
     LinearizedFrictionCone,
     PositiveNormalContactForces,
 )
+from .joint_conventions import JointOrder
 from .motion import (
     EMBER_G1_MOTION_REFERENCE,
     bundled_motion_reference_path,
@@ -260,6 +261,7 @@ class KinematicTrajectoryViewer:
         self,
         *,
         asset_name: str = "unitree_g1",
+        joint_order: JointOrder = "source",
         contact_mode: str = "feet_corners",
         contact_force_frame: Literal["world", "contact"] = "world",
         fps: float = 30.0,
@@ -274,6 +276,8 @@ class KinematicTrajectoryViewer:
 
         Args:
             asset_name: Asset alias or URDF path passed to
+                :class:`FloatingBaseDynamics`.
+            joint_order: Joint-coordinate order passed to
                 :class:`FloatingBaseDynamics`.
             contact_mode: Contact extraction mode such as ``"feet_corners"``
                 or ``"feet_centers"``.
@@ -294,6 +298,7 @@ class KinematicTrajectoryViewer:
             None.
         """
         self.asset_name = asset_name
+        self.joint_order = joint_order
         self.contact_mode = contact_mode
         self.contact_force_frame = contact_force_frame
         self.fps = float(fps)
@@ -306,6 +311,7 @@ class KinematicTrajectoryViewer:
 
         self.model = FloatingBaseDynamics(
             asset_name,
+            joint_order=joint_order,
             include_contact_forces=True,
             contact_mode=contact_mode,
             contact_force_frame=contact_force_frame,
@@ -1730,6 +1736,7 @@ class InputConstraintVerificationViewer(DynamicsVerificationViewer):
 def run_contact_viewer(
     *,
     asset_name: str = "unitree_g1",
+    joint_order: JointOrder = "source",
     contact_mode: str = "feet_corners",
     fps: float = 30.0,
     port: int = 8080,
@@ -1744,6 +1751,7 @@ def run_contact_viewer(
     Args:
         asset_name: Asset alias or URDF path passed to
             :class:`FloatingBaseDynamics`.
+        joint_order: Joint-coordinate order passed to the dynamics model.
         contact_mode: Contact extraction mode passed to
             :class:`FloatingBaseDynamics`, such as ``"feet_corners"`` or
             ``"feet_centers"``.
@@ -1760,6 +1768,7 @@ def run_contact_viewer(
     """
     KinematicTrajectoryViewer(
         asset_name=asset_name,
+        joint_order=joint_order,
         contact_mode=contact_mode,
         fps=fps,
         port=port,
@@ -1774,6 +1783,7 @@ def run_contact_viewer(
 def run_dynamics_verification_viewer(
     *,
     asset_name: str = "unitree_g1",
+    joint_order: JointOrder = "source",
     contact_mode: str = "feet_corners",
     contact_force_frame: Literal["world", "contact"] = "world",
     fps: float = 30.0,
@@ -1791,6 +1801,7 @@ def run_dynamics_verification_viewer(
     """Run the specialized Viser viewer for ``f(x)`` and ``g(x)`` checks."""
     DynamicsVerificationViewer(
         asset_name=asset_name,
+        joint_order=joint_order,
         contact_mode=contact_mode,
         contact_force_frame=contact_force_frame,
         fps=fps,
@@ -1810,6 +1821,7 @@ def run_dynamics_verification_viewer(
 def run_input_constraint_verification_viewer(
     *,
     asset_name: str = "unitree_g1",
+    joint_order: JointOrder = "source",
     contact_mode: str = "feet_corners",
     fps: float = 30.0,
     port: int = 8080,
@@ -1832,6 +1844,7 @@ def run_input_constraint_verification_viewer(
     """Run the specialized Viser viewer for input constraint checks."""
     InputConstraintVerificationViewer(
         asset_name=asset_name,
+        joint_order=joint_order,
         contact_mode=contact_mode,
         contact_force_frame="contact",
         fps=fps,
@@ -1858,6 +1871,7 @@ def export_dynamics_verification_videos(
     *,
     output_dir: str | Path,
     asset_name: str = "unitree_g1",
+    joint_order: JointOrder = "source",
     contact_mode: str = "feet_corners",
     contact_force_frame: Literal["world", "contact"] = "world",
     fps: float = 30.0,
@@ -1887,6 +1901,7 @@ def export_dynamics_verification_videos(
     ):
         viewer = DynamicsVerificationViewer(
             asset_name=asset_name,
+            joint_order=joint_order,
             contact_mode=contact_mode,
             contact_force_frame=contact_force_frame,
             fps=fps,
@@ -1918,6 +1933,11 @@ def main() -> None:
     """Parse CLI arguments and launch a Viser viewer."""
     parser = argparse.ArgumentParser(description="Visualize Unitree G1 trajectories and dynamics.")
     parser.add_argument("--asset", default="unitree_g1")
+    parser.add_argument(
+        "--joint-order",
+        choices=("source", "unitree_g1_29dof"),
+        default="source",
+    )
     parser.add_argument("--contact-mode", default="feet_corners", choices=("feet_corners", "feet_centers"))
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--port", type=int, default=8080)
@@ -1954,6 +1974,7 @@ def main() -> None:
         robot_opacity = 0.35 if args.dynamics_verification or args.input_constraint_verification else 1.0
     kwargs = dict(
         asset_name=args.asset,
+        joint_order=args.joint_order,
         contact_mode=args.contact_mode,
         fps=args.fps,
         port=args.port,
@@ -2178,11 +2199,13 @@ def _joint_effort_limit_tensor(model: FloatingBaseDynamics) -> torch.Tensor:
     """Return URDF effort limits in the model joint order."""
     if len(model.asset.urdf.joints) != len(model.joint_names):
         raise ValueError("URDF joint count does not match the dynamics joint count.")
+    joint_by_name = {joint.name: joint for joint in model.asset.urdf.joints}
     limits: list[float] = []
     missing: list[str] = []
-    for index, joint in enumerate(model.asset.urdf.joints):
-        if joint.name != model.joint_names[index]:
-            raise ValueError("URDF joint order does not match the dynamics joint order.")
+    for joint_name in model.joint_names:
+        joint = joint_by_name.get(joint_name)
+        if joint is None:
+            raise ValueError(f"Dynamics joint {joint_name!r} is missing from the URDF.")
         if joint.effort is None:
             missing.append(joint.name)
             limits.append(0.0)

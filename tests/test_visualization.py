@@ -3,11 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from focodyn import FloatingBaseDynamics
 from focodyn.visualization import (
     KinematicTrajectoryViewer,
     _animation_status,
     _clamp_frame,
     _floor_geometry_from_states,
+    _joint_effort_limit_tensor,
 )
 
 
@@ -70,3 +72,21 @@ def test_mesh_color_override_uses_transparency_only_when_requested() -> None:
 
     viewer.robot_opacity = 0.35
     assert viewer._mesh_color_override() == (190, 198, 208, 0.35)
+
+
+def test_joint_effort_limits_follow_selected_joint_order() -> None:
+    pytest.importorskip("adam")
+    source = FloatingBaseDynamics("g1_37dof_minimal", dtype=torch.float64)
+    compatible = FloatingBaseDynamics(
+        "g1_37dof_minimal",
+        joint_order="unitree_g1_29dof",
+        dtype=torch.float64,
+    )
+
+    source_limits = _joint_effort_limit_tensor(source)
+    compatible_limits = _joint_effort_limit_tensor(compatible)
+
+    for name in source.joint_names:
+        assert compatible_limits[compatible.joint_names.index(name)] == source_limits[
+            source.joint_names.index(name)
+        ]
