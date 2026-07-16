@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import pytest
 import torch
 
 from focodyn.rotations import (
     continuous_quaternions_wxyz,
-    matrix_to_rpy_numpy,
     matrix_to_quaternion_wxyz,
     matrix_to_rotation_6d,
     normalize_quaternion_wxyz,
@@ -16,13 +14,11 @@ from focodyn.rotations import (
     quaternion_derivative_from_world_angular_velocity,
     quaternion_multiply_wxyz,
     quaternion_second_derivative_from_world_angular_acceleration,
-    quaternion_xyzw_to_matrix_numpy,
     quaternion_wxyz_to_matrix,
     rotation_6d_to_matrix,
     rotation_6d_to_matrix_and_derivative,
     rpy_to_matrix,
     skew,
-    transform_from_position_quaternion_xyzw_numpy,
     unwrap_angles,
     world_angular_velocity_from_quaternion_derivative,
     world_angular_velocity_from_rotation_derivative,
@@ -31,35 +27,6 @@ from focodyn.rotations import (
 
 DTYPE = torch.float64
 ATOL = 1e-9
-
-
-def test_numpy_rotation_helpers_for_usd_conversion() -> None:
-    half_sqrt = math.sqrt(0.5)
-    quaternion_xyzw = np.asarray([0.0, 0.0, half_sqrt, half_sqrt])
-
-    rotation = quaternion_xyzw_to_matrix_numpy(quaternion_xyzw)
-    rpy = matrix_to_rpy_numpy(rotation)
-    transform = transform_from_position_quaternion_xyzw_numpy(
-        np.asarray([1.0, 2.0, 3.0]), quaternion_xyzw
-    )
-
-    assert np.allclose(
-        rotation,
-        np.asarray([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
-        atol=ATOL,
-    )
-    assert np.allclose(rpy, (0.0, 0.0, math.pi / 2.0), atol=ATOL)
-    assert np.allclose(transform[:3, :3], rotation, atol=ATOL)
-    assert np.array_equal(transform[:3, 3], np.asarray([1.0, 2.0, 3.0]))
-
-
-def test_numpy_rotation_helpers_validate_shapes() -> None:
-    with pytest.raises(ValueError, match="shape"):
-        quaternion_xyzw_to_matrix_numpy(np.zeros(3))
-    with pytest.raises(ValueError, match="shape"):
-        matrix_to_rpy_numpy(np.eye(4))
-    with pytest.raises(ValueError, match="shape"):
-        transform_from_position_quaternion_xyzw_numpy(np.zeros(2), np.zeros(4))
 
 
 def _weighted_sum(tensor: torch.Tensor) -> torch.Tensor:

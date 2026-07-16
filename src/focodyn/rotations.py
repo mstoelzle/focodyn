@@ -14,79 +14,7 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import torch
-
-
-def quaternion_xyzw_to_matrix_numpy(quaternion_xyzw: np.ndarray) -> np.ndarray:
-    """Convert one scalar-last quaternion to a NumPy rotation matrix.
-
-    Args:
-        quaternion_xyzw: Quaternion with shape ``(4,)`` in ``(x, y, z, w)``
-            order. A zero or non-finite norm returns the identity matrix.
-
-    Returns:
-        Rotation matrix with shape ``(3, 3)`` mapping local vectors into the
-        parent frame.
-    """
-    quaternion = np.asarray(quaternion_xyzw, dtype=np.float64)
-    if quaternion.shape != (4,):
-        raise ValueError(
-            f"quaternion_xyzw must have shape (4,). Got {quaternion.shape}."
-        )
-    x, y, z, w = quaternion
-    norm = float(np.linalg.norm(quaternion))
-    if not math.isfinite(norm) or norm < 1e-12:
-        return np.eye(3, dtype=np.float64)
-    x, y, z, w = x / norm, y / norm, z / norm, w / norm
-    return np.asarray(
-        [
-            [
-                1 - 2 * (y * y + z * z),
-                2 * (x * y - z * w),
-                2 * (x * z + y * w),
-            ],
-            [
-                2 * (x * y + z * w),
-                1 - 2 * (x * x + z * z),
-                2 * (y * z - x * w),
-            ],
-            [
-                2 * (x * z - y * w),
-                2 * (y * z + x * w),
-                1 - 2 * (x * x + y * y),
-            ],
-        ],
-        dtype=np.float64,
-    )
-
-
-def matrix_to_rpy_numpy(rotation: np.ndarray) -> tuple[float, float, float]:
-    """Convert one NumPy rotation matrix to fixed-axis URDF RPY angles."""
-    matrix = np.asarray(rotation, dtype=np.float64)
-    if matrix.shape != (3, 3):
-        raise ValueError(f"rotation must have shape (3, 3). Got {matrix.shape}.")
-    pitch = math.atan2(-matrix[2, 0], math.hypot(matrix[0, 0], matrix[1, 0]))
-    if abs(math.cos(pitch)) > 1e-10:
-        roll = math.atan2(matrix[2, 1], matrix[2, 2])
-        yaw = math.atan2(matrix[1, 0], matrix[0, 0])
-    else:
-        roll = math.atan2(-matrix[1, 2], matrix[1, 1])
-        yaw = 0.0
-    return roll, pitch, yaw
-
-
-def transform_from_position_quaternion_xyzw_numpy(
-    position: np.ndarray, quaternion_xyzw: np.ndarray
-) -> np.ndarray:
-    """Build a homogeneous transform from a position and scalar-last quaternion."""
-    translation = np.asarray(position, dtype=np.float64)
-    if translation.shape != (3,):
-        raise ValueError(f"position must have shape (3,). Got {translation.shape}.")
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = quaternion_xyzw_to_matrix_numpy(quaternion_xyzw)
-    transform[:3, 3] = translation
-    return transform
 
 
 def normalize_quaternion_wxyz(q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:

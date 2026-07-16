@@ -18,10 +18,10 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from focodyn.rotations import (
-    matrix_to_rpy_numpy,
-    quaternion_xyzw_to_matrix_numpy,
-    transform_from_position_quaternion_xyzw_numpy,
+from focodyn.rotations_numpy import (
+    matrix_to_rpy,
+    quaternion_wxyz_to_matrix,
+    transform_from_position_quaternion_wxyz,
 )
 
 try:
@@ -84,21 +84,21 @@ def _fmt(values) -> str:
     return " ".join(f"{float(value):.12g}" for value in values)
 
 
-def _quat_xyzw(quaternion) -> np.ndarray:
+def _quat_wxyz(quaternion) -> np.ndarray:
     imaginary = quaternion.GetImaginary()
     return np.asarray(
         [
+            float(quaternion.GetReal()),
             float(imaginary[0]),
             float(imaginary[1]),
             float(imaginary[2]),
-            float(quaternion.GetReal()),
         ],
         dtype=np.float64,
     )
 
 
-def _rpy_from_quat(quaternion) -> tuple[float, float, float]:
-    return matrix_to_rpy_numpy(quaternion_xyzw_to_matrix_numpy(_quat_xyzw(quaternion)))
+def _rpy_from_quat(quaternion) -> np.ndarray:
+    return matrix_to_rpy(quaternion_wxyz_to_matrix(_quat_wxyz(quaternion)))
 
 
 def _visual_triangles(
@@ -251,18 +251,16 @@ def _joint_record(prim) -> dict:
     pos1 = prim.GetAttribute("physics:localPos1").Get()
     rot0 = prim.GetAttribute("physics:localRot0").Get()
     rot1 = prim.GetAttribute("physics:localRot1").Get()
-    origin = transform_from_position_quaternion_xyzw_numpy(
-        pos0, _quat_xyzw(rot0)
-    ) @ np.linalg.inv(
-        transform_from_position_quaternion_xyzw_numpy(pos1, _quat_xyzw(rot1))
-    )
+    origin = transform_from_position_quaternion_wxyz(
+        pos0, _quat_wxyz(rot0)
+    ) @ np.linalg.inv(transform_from_position_quaternion_wxyz(pos1, _quat_wxyz(rot1)))
     return {
         "prim": prim,
         "name": prim.GetName(),
         "parent": body0_targets[0].name,
         "child": body1_targets[0].name,
         "xyz": origin[:3, 3],
-        "rpy": matrix_to_rpy_numpy(origin[:3, :3]),
+        "rpy": matrix_to_rpy(origin[:3, :3]),
     }
 
 
