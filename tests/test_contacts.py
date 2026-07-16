@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,9 @@ from focodyn.urdf import CollisionInfo, UrdfInfo
 @pytest.fixture(scope="module")
 def model() -> FloatingBaseDynamics:
     pytest.importorskip("adam")
-    return FloatingBaseDynamics("unitree_g1", include_contact_forces=True, dtype=torch.float64)
+    return FloatingBaseDynamics(
+        "unitree_g1", include_contact_forces=True, dtype=torch.float64
+    )
 
 
 def test_contact_fk_and_jacobian_shapes(model: FloatingBaseDynamics) -> None:
@@ -27,11 +30,21 @@ def test_contact_fk_and_jacobian_shapes(model: FloatingBaseDynamics) -> None:
     x = model.neutral_state()
     split = model.split_state(x)
     base_transform = model.base_transform(x)
-    positions = model.contact_model.contact_positions(base_transform, split.joint_positions.squeeze(0))
-    poses = model.contact_model.contact_poses(base_transform, split.joint_positions.squeeze(0))
-    quaternions = model.contact_model.contact_quaternions(base_transform, split.joint_positions.squeeze(0))
-    normals = model.contact_model.contact_normals(base_transform, split.joint_positions.squeeze(0))
-    jacobian = model.contact_model.contact_jacobian(base_transform, split.joint_positions.squeeze(0))
+    positions = model.contact_model.contact_positions(
+        base_transform, split.joint_positions.squeeze(0)
+    )
+    poses = model.contact_model.contact_poses(
+        base_transform, split.joint_positions.squeeze(0)
+    )
+    quaternions = model.contact_model.contact_quaternions(
+        base_transform, split.joint_positions.squeeze(0)
+    )
+    normals = model.contact_model.contact_normals(
+        base_transform, split.joint_positions.squeeze(0)
+    )
+    jacobian = model.contact_model.contact_jacobian(
+        base_transform, split.joint_positions.squeeze(0)
+    )
     jacobian_dot = model.contact_model.contact_jacobian_dot(
         base_transform,
         split.joint_positions.squeeze(0),
@@ -73,7 +86,9 @@ def test_batched_contact_fk_and_jacobian_shapes(model: FloatingBaseDynamics) -> 
     base_transform = model.base_transform(x)
     poses = model.contact_model.contact_poses(base_transform, split.joint_positions)
     normals = model.contact_model.contact_normals(base_transform, split.joint_positions)
-    jacobian = model.contact_model.contact_jacobian(base_transform, split.joint_positions)
+    jacobian = model.contact_model.contact_jacobian(
+        base_transform, split.joint_positions
+    )
     jacobian_dot = model.contact_model.contact_jacobian_dot(
         base_transform,
         split.joint_positions,
@@ -132,7 +147,9 @@ def test_contact_jacobian_calls_adam_once_per_unique_link(
     assert jacobian_calls == unique_links
 
 
-def test_contact_jacobian_matches_autograd_contact_fk(model: FloatingBaseDynamics) -> None:
+def test_contact_jacobian_matches_autograd_contact_fk(
+    model: FloatingBaseDynamics,
+) -> None:
     assert model.contact_model is not None
     x = model.neutral_state()
     split = model.split_state(x)
@@ -142,10 +159,16 @@ def test_contact_jacobian_matches_autograd_contact_fk(model: FloatingBaseDynamic
     base_transform = model.base_transform(x)
 
     def contact_positions_from_joints(joint_positions: torch.Tensor) -> torch.Tensor:
-        return model.contact_model.contact_positions(base_transform, joint_positions).reshape(-1)
+        return model.contact_model.contact_positions(
+            base_transform, joint_positions
+        ).reshape(-1)
 
-    autodiff_jacobian = torch.autograd.functional.jacobian(contact_positions_from_joints, q)
-    analytical_jacobian = model.contact_model.contact_jacobian(base_transform, q.detach())[:, 6:]
+    autodiff_jacobian = torch.autograd.functional.jacobian(
+        contact_positions_from_joints, q
+    )
+    analytical_jacobian = model.contact_model.contact_jacobian(
+        base_transform, q.detach()
+    )[:, 6:]
     assert torch.allclose(analytical_jacobian, autodiff_jacobian, atol=1e-8, rtol=1e-7)
 
 
@@ -174,8 +197,12 @@ def test_contact_jacobian_dot_velocity_matches_finite_difference() -> None:
         base_velocity,
         q_dot,
     )
-    jacobian_plus = model.contact_model.contact_jacobian(base_transform, q + eps * q_dot)
-    jacobian_minus = model.contact_model.contact_jacobian(base_transform, q - eps * q_dot)
+    jacobian_plus = model.contact_model.contact_jacobian(
+        base_transform, q + eps * q_dot
+    )
+    jacobian_minus = model.contact_model.contact_jacobian(
+        base_transform, q - eps * q_dot
+    )
     finite_difference = (jacobian_plus - jacobian_minus) / (2.0 * eps)
 
     assert torch.allclose(
@@ -255,11 +282,19 @@ def test_flat_terrain_contact_detector_reports_distances() -> None:
 
     state = detector.detect(positions)
 
-    assert torch.allclose(state.signed_distances, torch.tensor([0.03, -0.02], dtype=torch.float64))
-    assert torch.allclose(state.penetration_depths, torch.tensor([0.0, 0.02], dtype=torch.float64))
-    assert torch.allclose(state.nearest_points[:, 2], torch.zeros(2, dtype=torch.float64))
+    assert torch.allclose(
+        state.signed_distances, torch.tensor([0.03, -0.02], dtype=torch.float64)
+    )
+    assert torch.allclose(
+        state.penetration_depths, torch.tensor([0.0, 0.02], dtype=torch.float64)
+    )
+    assert torch.allclose(
+        state.nearest_points[:, 2], torch.zeros(2, dtype=torch.float64)
+    )
     assert torch.equal(state.in_contact, torch.tensor([False, True]))
-    assert torch.allclose(state.normals, torch.tensor([[0.0, 0.0, 1.0]] * 2, dtype=torch.float64))
+    assert torch.allclose(
+        state.normals, torch.tensor([[0.0, 0.0, 1.0]] * 2, dtype=torch.float64)
+    )
 
 
 def test_flat_terrain_contact_detector_validates_normal_and_position_shape() -> None:
@@ -290,8 +325,12 @@ def test_basic_contact_force_resolver_support_force_and_frames() -> None:
     resolved = resolver.resolve(contact_state, total_normal_force=torch.tensor(20.0))
 
     assert resolved.force_frame == "world"
-    assert torch.allclose(resolved.normal_forces, torch.tensor([20.0, 10.0], dtype=torch.float64))
-    assert torch.allclose(resolved.world_forces[:, :2], torch.zeros(2, 2, dtype=torch.float64))
+    assert torch.allclose(
+        resolved.normal_forces, torch.tensor([20.0, 10.0], dtype=torch.float64)
+    )
+    assert torch.allclose(
+        resolved.world_forces[:, :2], torch.zeros(2, 2, dtype=torch.float64)
+    )
     assert torch.allclose(resolved.world_forces[:, 2], resolved.normal_forces)
 
     transforms = torch.eye(4, dtype=torch.float64).repeat(2, 1, 1)
@@ -300,13 +339,19 @@ def test_basic_contact_force_resolver_support_force_and_frames() -> None:
         quaternions_wxyz=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2, dtype=torch.float64),
         transforms=transforms,
     )
-    contact_resolver = BasicContactForceResolver(force_frame="contact", normal_stiffness=1000.0)
-    contact_forces = contact_resolver.resolve(contact_state, total_normal_force=20.0, contact_poses=poses)
+    contact_resolver = BasicContactForceResolver(
+        force_frame="contact", normal_stiffness=1000.0
+    )
+    contact_forces = contact_resolver.resolve(
+        contact_state, total_normal_force=20.0, contact_poses=poses
+    )
     assert contact_forces.force_frame == "contact"
     assert torch.allclose(contact_forces.forces, contact_forces.world_forces)
 
 
-def test_basic_contact_force_resolver_applies_velocity_damping_and_friction_limits() -> None:
+def test_basic_contact_force_resolver_applies_velocity_damping_and_friction_limits() -> (
+    None
+):
     detector = FlatTerrainContactDetector(contact_threshold=0.05, dtype=torch.float64)
     positions = torch.tensor(
         [
@@ -330,11 +375,17 @@ def test_basic_contact_force_resolver_applies_velocity_damping_and_friction_limi
         friction_coefficient=0.5,
     )
 
-    resolved = resolver(contact_state, contact_velocities=velocities, total_normal_force=torch.tensor(20.0))
+    resolved = resolver(
+        contact_state,
+        contact_velocities=velocities,
+        total_normal_force=torch.tensor(20.0),
+    )
     tangential_norm = torch.linalg.norm(resolved.world_forces[..., :2], dim=-1)
 
     assert resolved.forces.shape == positions.shape
-    assert torch.allclose(resolved.world_forces[1, 0], torch.zeros(3, dtype=torch.float64))
+    assert torch.allclose(
+        resolved.world_forces[1, 0], torch.zeros(3, dtype=torch.float64)
+    )
     assert torch.all(resolved.normal_forces[contact_state.in_contact] > 0.0)
     assert torch.all(tangential_norm <= 0.5 * resolved.normal_forces + 1e-12)
 
@@ -359,7 +410,10 @@ def test_contact_frame_resolver_rotates_world_forces_into_contact_frame() -> Non
 
     assert torch.allclose(
         resolved.forces,
-        torch.matmul(transform[..., :3, :3].transpose(-1, -2), resolved.world_forces.unsqueeze(-1)).squeeze(-1),
+        torch.matmul(
+            transform[..., :3, :3].transpose(-1, -2),
+            resolved.world_forces.unsqueeze(-1),
+        ).squeeze(-1),
     )
 
 
@@ -380,8 +434,12 @@ def test_contact_model_without_kindyn_exposes_static_specs_and_errors() -> None:
     asset = _contact_asset(
         default_contact_links=("left_foot",),
         collisions=(
-            CollisionInfo("left_foot", (0.2, -0.1, 0.0), (0.0, 0.0, 0.0), "sphere", (0.02,)),
-            CollisionInfo("left_foot", (-0.2, 0.1, 0.0), (0.0, 0.0, 0.0), "sphere", (0.02,)),
+            CollisionInfo(
+                "left_foot", (0.2, -0.1, 0.0), (0.0, 0.0, 0.0), "sphere", (0.02,)
+            ),
+            CollisionInfo(
+                "left_foot", (-0.2, 0.1, 0.0), (0.0, 0.0, 0.0), "sphere", (0.02,)
+            ),
         ),
     )
     model = FloatingBaseContactModel(asset, mode="feet_centers", dtype=torch.float64)
@@ -391,13 +449,19 @@ def test_contact_model_without_kindyn_exposes_static_specs_and_errors() -> None:
     assert model.num_contacts == 1
     assert model.force_dim == 3
     assert model.contact_names == ("left_foot:center",)
-    assert torch.allclose(model.local_offsets.squeeze(0), torch.zeros(3, dtype=torch.float64))
     assert torch.allclose(
-        model.contact_force_transform(base_transform, joint_positions, force_frame="world"),
+        model.local_offsets.squeeze(0), torch.zeros(3, dtype=torch.float64)
+    )
+    assert torch.allclose(
+        model.contact_force_transform(
+            base_transform, joint_positions, force_frame="world"
+        ),
         torch.eye(3, dtype=torch.float64),
     )
     with pytest.raises(ValueError, match="force_frame"):
-        model.contact_force_transform(base_transform, joint_positions, force_frame="bad")
+        model.contact_force_transform(
+            base_transform, joint_positions, force_frame="bad"
+        )
     with pytest.raises(RuntimeError, match="KinDynComputations"):
         model._fk("left_foot", base_transform, joint_positions)
     with pytest.raises(RuntimeError, match="KinDynComputations"):
@@ -406,13 +470,23 @@ def test_contact_model_without_kindyn_exposes_static_specs_and_errors() -> None:
 
 def test_contact_model_reports_missing_or_unknown_static_contact_specs() -> None:
     with pytest.raises(ValueError, match="no default"):
-        FloatingBaseContactModel(_contact_asset(default_contact_links=(), collisions=()))
+        FloatingBaseContactModel(
+            _contact_asset(default_contact_links=(), collisions=())
+        )
 
-    with pytest.raises(ValueError, match="No sphere"):
+    with pytest.raises(ValueError, match="No sphere or box"):
         FloatingBaseContactModel(
             _contact_asset(
                 default_contact_links=("left_foot",),
-                collisions=(CollisionInfo("left_foot", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), "box", (1.0, 1.0, 1.0)),),
+                collisions=(
+                    CollisionInfo(
+                        "left_foot",
+                        (0.0, 0.0, 0.0),
+                        (0.0, 0.0, 0.0),
+                        "cylinder",
+                        (1.0, 1.0),
+                    ),
+                ),
             )
         )
 
@@ -420,10 +494,51 @@ def test_contact_model_reports_missing_or_unknown_static_contact_specs() -> None
         FloatingBaseContactModel(
             _contact_asset(
                 default_contact_links=("left_foot",),
-                collisions=(CollisionInfo("left_foot", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), "sphere", (0.02,)),),
+                collisions=(
+                    CollisionInfo(
+                        "left_foot", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), "sphere", (0.02,)
+                    ),
+                ),
             ),
             mode="toes",
         )
+
+
+def test_contact_model_derives_bottom_corners_from_rotated_box() -> None:
+    asset = _contact_asset(
+        default_contact_links=("left_foot",),
+        collisions=(
+            CollisionInfo(
+                "left_foot",
+                (1.0, 2.0, 3.0),
+                (0.0, 0.0, math.pi / 2.0),
+                "box",
+                (2.0, 4.0, 0.2),
+            ),
+        ),
+    )
+    corners = FloatingBaseContactModel(asset, mode="feet_corners", dtype=torch.float64)
+    center = FloatingBaseContactModel(asset, mode="feet_centers", dtype=torch.float64)
+
+    expected = torch.tensor(
+        [
+            [-1.0, 1.0, 2.9],
+            [-1.0, 3.0, 2.9],
+            [3.0, 1.0, 2.9],
+            [3.0, 3.0, 2.9],
+        ],
+        dtype=torch.float64,
+    )
+    assert corners.num_contacts == 4
+    assert torch.allclose(corners.local_offsets, expected)
+    assert torch.allclose(
+        center.local_offsets, torch.tensor([[1.0, 2.0, 2.9]], dtype=torch.float64)
+    )
+    expected_rotation = torch.tensor(
+        [[[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
+        dtype=torch.float64,
+    )
+    assert torch.allclose(center.local_rotations, expected_rotation, atol=1e-12)
 
 
 def _contact_asset(

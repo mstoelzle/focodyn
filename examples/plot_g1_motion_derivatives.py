@@ -109,6 +109,11 @@ def plot_motion_derivative_lambdas(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot Whittaker-smoothed motion derivatives.")
     parser.add_argument("--asset", default="unitree_g1")
+    parser.add_argument(
+        "--joint-order",
+        choices=("source", "unitree_g1_29dof"),
+        default="source",
+    )
     parser.add_argument("--motion-reference", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("outputs/motion_derivative_lambdas.pdf"))
     parser.add_argument("--lambdas", type=float, nargs="+", default=(10.0, 100.0, 1000.0, 10000.0))
@@ -116,7 +121,12 @@ def main() -> None:
     parser.add_argument("--d-order", type=int, default=2)
     args = parser.parse_args()
 
-    model = FloatingBaseDynamics(args.asset, include_contact_forces=True, dtype=torch.float64)
+    model = FloatingBaseDynamics(
+        args.asset,
+        joint_order=args.joint_order,
+        include_contact_forces=True,
+        dtype=torch.float64,
+    )
     motion = (
         load_kinematic_motion_reference(args.motion_reference, model)
         if args.motion_reference is not None

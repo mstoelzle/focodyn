@@ -12,6 +12,7 @@ from ._torch import (
 )
 from .assets import RobotAsset, load_asset
 from .contacts import FloatingBaseContactModel
+from .joint_conventions import JointOrder
 from .rotations import (
     normalize_quaternion_wxyz,
     quaternion_derivative_from_world_angular_velocity,
@@ -152,8 +153,8 @@ class FloatingBaseDynamics(torch.nn.Module):
     ``p_WB`` is the world-frame position of the floating-base/root link
     origin. ``quat_WB`` is a unit quaternion in ``(w, x, y, z)`` order and maps
     vectors from the base/root frame ``B`` to the world frame ``W``. The joint
-    vector ``s`` is ordered exactly as ``self.joint_names``; this list is parsed
-    from the URDF and passed to Adam.
+    vector ``s`` is ordered exactly as ``self.joint_names``; this list follows
+    the selected asset convention and is passed to Adam.
 
     The floating-base velocity uses Adam's mixed representation:
     ``v_WB`` and ``omega_WB`` are both expressed in the inertial/world frame.
@@ -174,6 +175,7 @@ class FloatingBaseDynamics(torch.nn.Module):
         self,
         asset_name: str = "unitree_g1",
         *,
+        joint_order: JointOrder = "source",
         include_contact_forces: bool = False,
         contact_mode: str = "feet_corners",
         contact_force_frame: Literal["world", "contact"] = "world",
@@ -186,6 +188,9 @@ class FloatingBaseDynamics(torch.nn.Module):
             asset_name: Built-in asset alias or direct URDF path. The asset
                 determines ``n_joints``, joint ordering, root link, and default
                 contact links.
+            joint_order: Joint-coordinate ordering convention. ``"source"``
+                preserves the asset's source order; ``"unitree_g1_29dof"``
+                aligns shared G1 joints with the Unitree 29-DoF convention.
             include_contact_forces: Whether :meth:`g` includes contact-force
                 input columns after the joint-torque columns.
             contact_mode: Contact extraction mode passed to
@@ -209,7 +214,7 @@ class FloatingBaseDynamics(torch.nn.Module):
             ImportError: If Adam's PyTorch backend is unavailable.
         """
         super().__init__()
-        self.asset: RobotAsset = load_asset(asset_name)
+        self.asset: RobotAsset = load_asset(asset_name, joint_order=joint_order)
         self.dtype = dtype
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.include_contact_forces = include_contact_forces

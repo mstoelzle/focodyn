@@ -8,11 +8,15 @@ import numpy as np
 import torch
 
 from .dynamics import FloatingBaseDynamics
+from .joint_conventions import (
+    UNITREE_G1_29DOF_JOINT_NAMES,
+    is_g1_37dof_minimal_joint_set,
+    map_g1_29dof_to_37dof,
+)
 
 
 DEFAULT_G1_MOTION_REFERENCE = "g1_fleaven_retargeted/JOOF_walk_poses_120_jpos.npy"
 EMBER_G1_MOTION_REFERENCE = "g1_amass_retargeted/cmu_06_01_poses_120_jpos.npz"
-
 
 @dataclass(frozen=True)
 class KinematicMotionReference:
@@ -95,7 +99,9 @@ def load_kinematic_motion_reference(
     motion_path = Path(path)
     ground_to_contacts = False
     if motion_path.suffix == ".npy":
-        raw_motion = np.asarray(np.load(motion_path, allow_pickle=False), dtype=np.float64)
+        raw_motion = np.asarray(
+            np.load(motion_path, allow_pickle=False), dtype=np.float64
+        )
         if raw_motion.ndim != 2 or raw_motion.shape[1] != 36:
             raise ValueError(
                 "Raw G1 motion .npy files must have shape (frames, 36): "
@@ -115,10 +121,18 @@ def load_kinematic_motion_reference(
 
         if "dof_positions" in data:
             root_index = _name_index(data["body_names"], root_body_name, what="body")
-            joint_positions = _remap_named_dofs(data["dof_names"], data["dof_positions"], model)
-            joint_velocities = _remap_named_dofs(data["dof_names"], data["dof_velocities"], model)
-            root_positions = np.asarray(data["body_positions"][:, root_index, :], dtype=np.float64)
-            root_quaternions = np.asarray(data["body_rotations"][:, root_index, :], dtype=np.float64)
+            joint_positions = _remap_named_dofs(
+                data["dof_names"], data["dof_positions"], model
+            )
+            joint_velocities = _remap_named_dofs(
+                data["dof_names"], data["dof_velocities"], model
+            )
+            root_positions = np.asarray(
+                data["body_positions"][:, root_index, :], dtype=np.float64
+            )
+            root_quaternions = np.asarray(
+                data["body_rotations"][:, root_index, :], dtype=np.float64
+            )
             root_linear_velocities = np.asarray(
                 data["body_linear_velocities"][:, root_index, :], dtype=np.float64
             )
@@ -136,15 +150,21 @@ def load_kinematic_motion_reference(
             raise ValueError(f"Unsupported motion reference format: {motion_path}")
 
     frames = joint_positions.shape[0]
-    states = torch.zeros(frames, model.state_dim, dtype=model.dtype, device=model.device)
+    states = torch.zeros(
+        frames, model.state_dim, dtype=model.dtype, device=model.device
+    )
     states[:, :3] = _as_tensor(root_positions, model)
     states[:, 3:7] = _as_tensor(_normalize_quaternions(root_quaternions), model)
     states[:, 7 : 7 + model.n_joints] = _as_tensor(joint_positions, model)
     if ground_to_contacts:
         _shift_lowest_contact_to_ground(states, model)
     velocity_start = model.nq
-    states[:, velocity_start : velocity_start + 3] = _as_tensor(root_linear_velocities, model)
-    states[:, velocity_start + 3 : velocity_start + 6] = _as_tensor(root_angular_velocities, model)
+    states[:, velocity_start : velocity_start + 3] = _as_tensor(
+        root_linear_velocities, model
+    )
+    states[:, velocity_start + 3 : velocity_start + 6] = _as_tensor(
+        root_angular_velocities, model
+    )
     states[:, velocity_start + 6 :] = _as_tensor(joint_velocities, model)
     times = torch.arange(frames, dtype=model.dtype, device=model.device) / fps
 
@@ -157,7 +177,9 @@ def load_kinematic_motion_reference(
     )
 
 
-def default_g1_motion_reference(model: FloatingBaseDynamics) -> KinematicMotionReference:
+def default_g1_motion_reference(
+    model: FloatingBaseDynamics,
+) -> KinematicMotionReference:
     """Load the bundled G1 retargeted AMASS walking reference.
 
     Args:
@@ -190,11 +212,15 @@ def _name_index(names: np.ndarray, name: str, *, what: str) -> int:
     """
     names_list = [str(item) for item in names.tolist()]
     if name not in names_list:
-        raise ValueError(f"Motion reference is missing {what} {name!r}. Available: {names_list}")
+        raise ValueError(
+            f"Motion reference is missing {what} {name!r}. Available: {names_list}"
+        )
     return names_list.index(name)
 
 
-def _remap_named_dofs(names: np.ndarray, values: np.ndarray, model: FloatingBaseDynamics) -> np.ndarray:
+def _remap_named_dofs(
+    names: np.ndarray, values: np.ndarray, model: FloatingBaseDynamics
+) -> np.ndarray:
     """Remap named DOF values into the model's joint order.
 
     Args:
@@ -209,6 +235,8 @@ def _remap_named_dofs(names: np.ndarray, values: np.ndarray, model: FloatingBase
         ValueError: If any model joint is missing from ``names``.
     """
     names_list = [str(item) for item in names.tolist()]
+    if is_g1_37dof_minimal_joint_set(model.joint_names):
+        return map_g1_29dof_to_37dof(values, names_list, model.joint_names)
     missing = [name for name in model.joint_names if name not in names_list]
     if missing:
         raise ValueError(f"Motion reference is missing model joints: {missing}")
@@ -230,6 +258,12 @@ def _remap_unnamed_dofs(values: np.ndarray, model: FloatingBaseDynamics) -> np.n
         ValueError: If ``n_dofs`` does not match ``model.n_joints``.
     """
     values = np.asarray(values, dtype=np.float64)
+    if is_g1_37dof_minimal_joint_set(model.joint_names) and values.shape[1] == len(
+        UNITREE_G1_29DOF_JOINT_NAMES
+    ):
+        return map_g1_29dof_to_37dof(
+            values, UNITREE_G1_29DOF_JOINT_NAMES, model.joint_names
+        )
     if values.shape[1] != model.n_joints:
         raise ValueError(
             "Unnamed motion reference DOFs must match model.n_joints. "
@@ -276,7 +310,9 @@ def _xyzw_to_wxyz(quaternions: np.ndarray) -> np.ndarray:
     return np.concatenate((quaternions[..., 3:4], quaternions[..., :3]), axis=-1)
 
 
-def _shift_lowest_contact_to_ground(states: torch.Tensor, model: FloatingBaseDynamics) -> None:
+def _shift_lowest_contact_to_ground(
+    states: torch.Tensor, model: FloatingBaseDynamics
+) -> None:
     """Translate root height so the lowest contact candidate is on ``z = 0``.
 
     Args:

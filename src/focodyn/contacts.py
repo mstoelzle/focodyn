@@ -9,6 +9,7 @@ import torch
 
 from .assets import RobotAsset, load_asset
 from .rotations import matrix_to_quaternion_wxyz, rpy_to_matrix, skew
+from .urdf import CollisionInfo
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,9 @@ class FlatTerrainContactDetector(torch.nn.Module):
         self.height = float(height)
         self.contact_threshold = float(contact_threshold)
         self.dtype = dtype
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
         normal_tensor = torch.as_tensor(normal, dtype=dtype, device=self.device)
         normal_norm = torch.linalg.norm(normal_tensor)
         if normal_norm <= 0:
@@ -291,19 +294,27 @@ class BasicContactForceResolver(torch.nn.Module):
             :class:`ResolvedContactForces`.
         """
         positions = contact_state.positions
-        normals = contact_state.normals.to(dtype=positions.dtype, device=positions.device)
+        normals = contact_state.normals.to(
+            dtype=positions.dtype, device=positions.device
+        )
         active = contact_state.in_contact
         active_float = active.to(dtype=positions.dtype)
 
         normal_force = self.normal_stiffness * contact_state.penetration_depths
         if contact_velocities is not None:
-            velocities = contact_velocities.to(dtype=positions.dtype, device=positions.device)
+            velocities = contact_velocities.to(
+                dtype=positions.dtype, device=positions.device
+            )
             normal_velocity = torch.sum(velocities * normals, dim=-1)
-            normal_force = normal_force + self.normal_damping * torch.clamp(-normal_velocity, min=0.0)
+            normal_force = normal_force + self.normal_damping * torch.clamp(
+                -normal_velocity, min=0.0
+            )
 
         normal_force = torch.clamp(normal_force, min=0.0) * active_float
         if total_normal_force is not None:
-            total = torch.as_tensor(total_normal_force, dtype=positions.dtype, device=positions.device)
+            total = torch.as_tensor(
+                total_normal_force, dtype=positions.dtype, device=positions.device
+            )
             while total.ndim < active.ndim - 1:
                 total = total.unsqueeze(-1)
             active_count = torch.clamp(active_float.sum(dim=-1), min=1.0)
@@ -312,8 +323,12 @@ class BasicContactForceResolver(torch.nn.Module):
 
         world_forces = normal_force.unsqueeze(-1) * normals
         if contact_velocities is not None and self.tangential_damping > 0.0:
-            velocities = contact_velocities.to(dtype=positions.dtype, device=positions.device)
-            normal_velocity = torch.sum(velocities * normals, dim=-1, keepdim=True) * normals
+            velocities = contact_velocities.to(
+                dtype=positions.dtype, device=positions.device
+            )
+            normal_velocity = (
+                torch.sum(velocities * normals, dim=-1, keepdim=True) * normals
+            )
             tangential_velocity = velocities - normal_velocity
             tangential_force = -self.tangential_damping * tangential_velocity
             tangential_norm = torch.linalg.norm(tangential_force, dim=-1, keepdim=True)
@@ -322,17 +337,23 @@ class BasicContactForceResolver(torch.nn.Module):
                 torch.ones_like(tangential_norm),
                 max_tangential / torch.clamp(tangential_norm, min=1e-12),
             )
-            world_forces = world_forces + tangential_force * scale * active_float.unsqueeze(-1)
+            world_forces = (
+                world_forces + tangential_force * scale * active_float.unsqueeze(-1)
+            )
 
         if self.force_frame == "world":
             forces = world_forces
         else:
             if contact_poses is None:
-                raise ValueError("contact_poses are required for contact-frame force output.")
+                raise ValueError(
+                    "contact_poses are required for contact-frame force output."
+                )
             rotations = contact_poses.transforms[..., :3, :3].to(
                 dtype=positions.dtype, device=positions.device
             )
-            forces = torch.matmul(rotations.transpose(-1, -2), world_forces.unsqueeze(-1)).squeeze(-1)
+            forces = torch.matmul(
+                rotations.transpose(-1, -2), world_forces.unsqueeze(-1)
+            ).squeeze(-1)
 
         return ResolvedContactForces(
             forces=forces,
@@ -347,8 +368,9 @@ class FloatingBaseContactModel(torch.nn.Module):
     """Differentiable contact-pose kinematics for floating-base legged robots.
 
     Contact frames are initialized from collision geometry in the URDF. For the
-    Unitree G1, the ankle-roll links contain four small sphere collision origins
-    per foot, which are used as foot-corner contact candidates.
+    Unitree G1 URDFs normally expose four small sphere collision origins per
+    foot. Assets with box-shaped feet use the four corners of each box's bottom
+    face instead.
 
     The returned pose convention follows the Adam homogeneous-transform
     convention: ``W_H_C`` maps contact-frame coordinates into world coordinates.
@@ -375,8 +397,8 @@ class FloatingBaseContactModel(torch.nn.Module):
                 forward kinematics and Jacobians. Public kinematic methods
                 require this object.
             mode: Contact extraction mode. ``"feet_corners"`` creates one
-                contact frame per foot-corner collision sphere; ``"feet_centers"``
-                creates one averaged frame per foot.
+                contact frame per foot-corner collision sphere or box corner;
+                ``"feet_centers"`` creates one averaged frame per foot.
             dtype: Torch dtype used for contact buffers.
             device: Torch device used for contact buffers. ``None`` selects CPU.
 
@@ -388,7 +410,9 @@ class FloatingBaseContactModel(torch.nn.Module):
         self.mode = mode
         self.kindyn = kin_dyn
         self.dtype = dtype
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
 
         specs = _contact_specs_from_asset(self.asset, mode)
         self.contact_specs = tuple(specs)
@@ -401,12 +425,20 @@ class FloatingBaseContactModel(torch.nn.Module):
                 unique_link_names.append(spec.link_name)
             contact_link_indices.append(unique_link_names.index(spec.link_name))
         self.unique_contact_link_names = tuple(unique_link_names)
-        offsets = torch.as_tensor([spec.offset for spec in specs], dtype=dtype, device=self.device)
-        local_rpy = torch.as_tensor([spec.rpy for spec in specs], dtype=dtype, device=self.device)
-        link_indices = torch.as_tensor(contact_link_indices, dtype=torch.long, device=self.device)
+        offsets = torch.as_tensor(
+            [spec.offset for spec in specs], dtype=dtype, device=self.device
+        )
+        local_rpy = torch.as_tensor(
+            [spec.rpy for spec in specs], dtype=dtype, device=self.device
+        )
+        link_indices = torch.as_tensor(
+            contact_link_indices, dtype=torch.long, device=self.device
+        )
         self.register_buffer("contact_link_indices", link_indices, persistent=False)
         self.register_buffer("local_offsets", offsets, persistent=False)
-        self.register_buffer("local_rotations", rpy_to_matrix(local_rpy), persistent=False)
+        self.register_buffer(
+            "local_rotations", rpy_to_matrix(local_rpy), persistent=False
+        )
 
     @property
     def num_contacts(self) -> int:
@@ -466,7 +498,9 @@ class FloatingBaseContactModel(torch.nn.Module):
             ``(batch, num_contacts, 4)`` in Adam/scalar-first ``(w, x, y, z)``
             order.
         """
-        rotations = self.contact_transforms(base_transform, joint_positions)[..., :3, :3]
+        rotations = self.contact_transforms(base_transform, joint_positions)[
+            ..., :3, :3
+        ]
         return matrix_to_quaternion_wxyz(rotations)
 
     def contact_poses(
@@ -533,7 +567,9 @@ class FloatingBaseContactModel(torch.nn.Module):
         rotation = link_transforms[..., :3, :3]
         translation = link_transforms[..., :3, 3]
         offsets = self.local_offsets.to(dtype=rotation.dtype, device=rotation.device)
-        local_rotations = self.local_rotations.to(dtype=rotation.dtype, device=rotation.device)
+        local_rotations = self.local_rotations.to(
+            dtype=rotation.dtype, device=rotation.device
+        )
 
         contact_rotation = torch.matmul(rotation, local_rotations)
         contact_translation = translation + torch.matmul(
@@ -727,16 +763,23 @@ class FloatingBaseContactModel(torch.nn.Module):
         if force_frame == "world":
             dim = self.force_dim
             batch_shape = base_transform.shape[:-2]
-            eye = torch.eye(dim, dtype=base_transform.dtype, device=base_transform.device)
+            eye = torch.eye(
+                dim, dtype=base_transform.dtype, device=base_transform.device
+            )
             return eye.expand(*batch_shape, dim, dim)
         if force_frame != "contact":
             raise ValueError("force_frame must be 'world' or 'contact'.")
 
-        rotations = self.contact_transforms(base_transform, joint_positions)[..., :3, :3]
+        rotations = self.contact_transforms(base_transform, joint_positions)[
+            ..., :3, :3
+        ]
         return _block_diag_rotations(rotations)
 
     def _fk(
-        self, link_name: str, base_transform: torch.Tensor, joint_positions: torch.Tensor
+        self,
+        link_name: str,
+        base_transform: torch.Tensor,
+        joint_positions: torch.Tensor,
     ) -> torch.Tensor:
         """Evaluate Adam forward kinematics for a link.
 
@@ -755,8 +798,12 @@ class FloatingBaseContactModel(torch.nn.Module):
             RuntimeError: If no Adam kinematics object was provided.
         """
         if self.kindyn is None:
-            raise RuntimeError("FloatingBaseContactModel requires an Adam KinDynComputations instance.")
-        return self.kindyn.forward_kinematics(link_name, base_transform, joint_positions)
+            raise RuntimeError(
+                "FloatingBaseContactModel requires an Adam KinDynComputations instance."
+            )
+        return self.kindyn.forward_kinematics(
+            link_name, base_transform, joint_positions
+        )
 
     def _stack_link_transforms(
         self, base_transform: torch.Tensor, joint_positions: torch.Tensor
@@ -781,7 +828,10 @@ class FloatingBaseContactModel(torch.nn.Module):
         return torch.stack(transforms, dim=-3)
 
     def _jacobian(
-        self, link_name: str, base_transform: torch.Tensor, joint_positions: torch.Tensor
+        self,
+        link_name: str,
+        base_transform: torch.Tensor,
+        joint_positions: torch.Tensor,
     ) -> torch.Tensor:
         """Evaluate Adam mixed-representation link Jacobian.
 
@@ -801,7 +851,9 @@ class FloatingBaseContactModel(torch.nn.Module):
             RuntimeError: If no Adam kinematics object was provided.
         """
         if self.kindyn is None:
-            raise RuntimeError("FloatingBaseContactModel requires an Adam KinDynComputations instance.")
+            raise RuntimeError(
+                "FloatingBaseContactModel requires an Adam KinDynComputations instance."
+            )
         return self.kindyn.jacobian(link_name, base_transform, joint_positions)
 
     def _stack_link_jacobians(
@@ -851,7 +903,9 @@ class FloatingBaseContactModel(torch.nn.Module):
             RuntimeError: If no Adam kinematics object was provided.
         """
         if self.kindyn is None:
-            raise RuntimeError("FloatingBaseContactModel requires an Adam KinDynComputations instance.")
+            raise RuntimeError(
+                "FloatingBaseContactModel requires an Adam KinDynComputations instance."
+            )
         return self.kindyn.jacobian_dot(
             link_name,
             base_transform,
@@ -925,22 +979,20 @@ def _contact_specs_from_asset(asset: RobotAsset, mode: str) -> list[ContactPoint
 
     Raises:
         ValueError: If the asset has no default contact links, if required foot
-            collision spheres are missing, or if ``mode`` is unknown.
+            collision spheres or boxes are missing, or if ``mode`` is unknown.
     """
     if not asset.default_contact_links:
         raise ValueError(f"Asset {asset.name!r} has no default foot contact links.")
 
     foot_collisions = {
-        link: [
-            collision
-            for collision in asset.urdf.collisions
-            if collision.link_name == link and collision.geometry_type == "sphere"
-        ]
+        link: _contact_candidates_for_link(asset, link)
         for link in asset.default_contact_links
     }
     missing = [link for link, collisions in foot_collisions.items() if not collisions]
     if missing:
-        raise ValueError(f"No sphere collision contact candidates found for {missing}.")
+        raise ValueError(
+            f"No sphere or box collision contact candidates found for {missing}."
+        )
 
     specs: list[ContactPointSpec] = []
     if mode == "feet_corners":
@@ -958,19 +1010,86 @@ def _contact_specs_from_asset(asset: RobotAsset, mode: str) -> list[ContactPoint
 
     if mode == "feet_centers":
         for link_name, collisions in foot_collisions.items():
-            points = np.asarray([collision.xyz for collision in collisions], dtype=np.float64)
+            points = np.asarray(
+                [collision.xyz for collision in collisions], dtype=np.float64
+            )
             center = np.mean(points, axis=0)
+            center_rpy = (
+                collisions[0].rpy
+                if all(
+                    collision.geometry_type == "box_corner" for collision in collisions
+                )
+                else (0.0, 0.0, 0.0)
+            )
             specs.append(
                 ContactPointSpec(
                     name=f"{link_name}:center",
                     link_name=link_name,
                     offset=tuple(float(value) for value in center),
-                    rpy=(0.0, 0.0, 0.0),
+                    rpy=tuple(float(value) for value in center_rpy),
                 )
             )
         return specs
 
     raise ValueError("Unknown contact mode. Expected 'feet_corners' or 'feet_centers'.")
+
+
+def _contact_candidates_for_link(
+    asset: RobotAsset, link_name: str
+) -> list[CollisionInfo]:
+    """Return explicit contact markers or derive them from foot boxes.
+
+    Existing G1 URDFs encode four intended contact points as collision
+    spheres. The USD-derived minimal model instead contains only ankle-roll
+    collision boxes, so its contact points are the transformed corners of each
+    box's bottom face. Explicit sphere markers always take precedence to keep
+    existing asset behavior unchanged.
+    """
+    link_collisions = [
+        collision
+        for collision in asset.urdf.collisions
+        if collision.link_name == link_name
+    ]
+    spheres = [
+        collision
+        for collision in link_collisions
+        if collision.geometry_type == "sphere"
+    ]
+    if spheres:
+        return spheres
+
+    candidates: list[CollisionInfo] = []
+    for collision in link_collisions:
+        if collision.geometry_type != "box" or len(collision.size) != 3:
+            continue
+        size = np.asarray(collision.size, dtype=np.float64)
+        half_extents = 0.5 * size
+        roll, pitch, yaw = collision.rpy
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        rotation = np.asarray(
+            [
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
+            ],
+            dtype=np.float64,
+        )
+        origin = np.asarray(collision.xyz, dtype=np.float64)
+        for x in (-half_extents[0], half_extents[0]):
+            for y in (-half_extents[1], half_extents[1]):
+                offset = origin + rotation @ np.asarray([x, y, -half_extents[2]])
+                candidates.append(
+                    CollisionInfo(
+                        link_name=link_name,
+                        xyz=tuple(float(value) for value in offset),
+                        rpy=collision.rpy,
+                        geometry_type="box_corner",
+                        size=(),
+                    )
+                )
+    return candidates
 
 
 def _sort_foot_collisions(collisions):

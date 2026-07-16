@@ -394,6 +394,11 @@ def main() -> None:
     """Run fixed-contact force analysis from the command line."""
     parser = argparse.ArgumentParser(description="Analyze fixed-contact forces on a kinematic trajectory.")
     parser.add_argument("--asset", default="unitree_g1")
+    parser.add_argument(
+        "--joint-order",
+        choices=("source", "unitree_g1_29dof"),
+        default="source",
+    )
     parser.add_argument("--contact-mode", default="feet_corners", choices=("feet_corners", "feet_centers"))
     parser.add_argument("--motion-reference", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/contact_forces"))
@@ -418,6 +423,7 @@ def main() -> None:
 
     model = FloatingBaseDynamics(
         args.asset,
+        joint_order=args.joint_order,
         include_contact_forces=True,
         contact_mode=args.contact_mode,
         dtype=torch.float64,
@@ -450,6 +456,7 @@ def main() -> None:
 
         viewer = DynamicsVerificationViewer(
             asset_name=args.asset,
+            joint_order=args.joint_order,
             contact_mode=args.contact_mode,
             contact_force_frame="world",
             port=args.port,

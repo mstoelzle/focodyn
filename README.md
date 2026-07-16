@@ -68,6 +68,35 @@ control_map = model.g(x)
 xdot_drift, control_map = model.f_and_g(x)  # shared mass matrix + solve
 ```
 
+The bundled 37-DoF USD-derived model is available through the same API and all
+existing `--asset` command-line options:
+
+```python
+model = FloatingBaseDynamics("g1_37dof_minimal", include_contact_forces=True)
+```
+
+It contains the older 23-DoF G1 body articulation plus 14 finger joints. Its
+dimensions are `n_joints=37`, `nq=44`, `nv=43`, and `state_dim=87`. The
+original USD is exposed as `model.asset.usd_path`; FoCoDyn dynamics and Viser
+visualization use the generated URDF companions. Passing a USD path directly
+is supported when same-stem `.urdf` and `.adam.urdf` companions are present.
+By default, `joint_names` and all joint-coordinate tensors preserve the
+movable-joint order of the source URDF (or the companion URDF for a USD path).
+To align the joints shared with current Unitree G1 models to their 29-DoF
+coordinate convention, opt in explicitly:
+
+```python
+model = FloatingBaseDynamics(
+    "g1_37dof_minimal",
+    joint_order="unitree_g1_29dof",
+)
+```
+
+The compatibility convention changes ordering only: it does not rename
+source joints, and it appends model-specific joints in source-relative order.
+The same choice is available as `--joint-order source` or
+`--joint-order unitree_g1_29dof` in commands that accept `--asset`.
+
 The dynamics are represented as:
 
 ```text
@@ -104,11 +133,11 @@ The generalized acceleration is `nu_dot = (v_dot_WB, omega_dot_WB, s_ddot)`.
 ## Contacts
 
 `FloatingBaseContactModel` initializes contact candidates from URDF collision
-geometry. For the Unitree G1, each ankle-roll link has four small sphere
-collisions; `feet_corners` uses those eight sphere origins, and `feet_centers`
-uses one averaged point per foot. The same interface is intended to support
-other floating-base legged robots as assets and contact extraction modes are
-added.
+geometry. Most bundled Unitree G1 URDFs place four small sphere collisions on
+each ankle-roll link. The USD-derived `g1_37dof_minimal` instead retains its
+foot collision boxes, whose four bottom-face corners are extracted
+automatically. `feet_corners` therefore exposes eight points for either
+representation, and `feet_centers` uses one averaged point per foot.
 
 Contacts are full `SE(3)` frames, not only points. `contact_poses(...)` returns
 world positions, `(w, x, y, z)` contact-to-world quaternions, and homogeneous
@@ -220,6 +249,21 @@ For inspecting the dynamics maps, use the specialized viewer:
 uv run --extra viz focodyn-visualize-dynamics --whittaker-lambda 100
 ```
 
+To select the bundled model through its USD source path, run:
+
+```bash
+uv run --extra viz focodyn-visualize-dynamics \
+  --asset src/focodyn/assets/robots/unitree_g1/g1_37dof_minimal.usd \
+  --joint-order source \
+  --whittaker-lambda 100
+```
+
+The `.usd` path is used to identify the asset and its provenance. The viewer
+then loads the adjacent `g1_37dof_minimal.urdf` and its STL files, while Adam
+uses `g1_37dof_minimal.adam.urdf`. Consequently, the `usd` optional dependency
+is not needed for viewing. The shorter equivalent is
+`--asset g1_37dof_minimal`.
+
 The dynamics viewer inherits the kinematic trajectory viewer and adds two
 modes. `f(x): inverse dynamics` ignores contacts and visualizes the virtual
 root wrench plus the largest joint torques from `M(q) nu_dot + h(q,nu)`.
@@ -252,6 +296,15 @@ For checking the affine input constraints along a kinematic reference, use:
 
 ```bash
 uv run --extra viz focodyn-visualize-input-constraints --whittaker-lambda 100
+```
+
+With the USD-derived model, use:
+
+```bash
+uv run --extra viz focodyn-visualize-input-constraints \
+  --asset src/focodyn/assets/robots/unitree_g1/g1_37dof_minimal.usd \
+  --joint-order source \
+  --whittaker-lambda 100
 ```
 
 This viewer follows the same derivative-estimation path as the dynamics
@@ -288,6 +341,92 @@ Robot assets under
 The upstream BSD 3-Clause license is included at
 `src/focodyn/assets/robots/unitree_g1/LICENSE.unitree_ros`.
 
+`g1_37dof_minimal.usd` is the byte-identical supplied USD crate with SHA-256
+`4f5e0600f24bed04d4c45b3921b6f3d7b6205463b0b1ac051cf2883dd3aaee67`.
+Its embedded documentation identifies it as a flattened export of the
+Unitree/Orbit G1 asset. The companion `g1_37dof_minimal.urdf`, Adam-compatible
+copy, and link-local STL meshes preserve the USD articulation and allow it to
+use FoCoDyn's URDF-backed APIs. USD-to-URDF regeneration is an offline asset
+preparation step implemented by `tools/convert_g1_usd_to_urdf.py`; neither the
+converter nor FoCoDyn requires Isaac Sim. The USD retains its
+environment-specific `OmniPBR.mdl` material reference; the generated
+visualization assets do not depend on that reference.
+
+### Regenerating the G1 USD companions
+
+Isaac Sim is **not required** to install, use, or regenerate this FoCoDyn
+asset. The repository tool uses the lightweight `usd-core` package, which
+provides the OpenUSD `pxr` Python bindings on macOS, Linux, and Windows. The
+tool is deliberately specific to this supplied G1 stage: it extracts `/g1`,
+validates the expected 37 movable joints, writes visual STL files, converts
+the two foot box meshes to URDF boxes, and creates both URDF companions.
+
+Install the optional converter dependency from the repository root:
+
+```bash
+uv sync --python 3.12 --extra usd
+```
+
+Then generate into a temporary directory first:
+
+```bash
+uv run --python 3.12 --extra usd python \
+  tools/convert_g1_usd_to_urdf.py \
+  src/focodyn/assets/robots/unitree_g1/g1_37dof_minimal.usd \
+  /tmp/g1_37dof_minimal_generated
+```
+
+The `usd` extra adds `usd-core`, which supplies the OpenUSD `pxr` bindings;
+it remains separate from FoCoDyn's default runtime dependencies and does not
+require an NVIDIA GPU. Python 3.12 is specified because OpenUSD wheels may lag
+the newest Python release. If it is not already present, `uv` downloads a
+managed interpreter. Running the script without `pxr` prints the corresponding
+`--extra usd` command.
+
+The generated files are:
+
+```text
+/tmp/g1_37dof_minimal_generated/g1_37dof_minimal.urdf
+/tmp/g1_37dof_minimal_generated/g1_37dof_minimal.adam.urdf
+/tmp/g1_37dof_minimal_generated/meshes/g1_37dof_minimal/*.stl
+```
+
+The converter writes movable joints in USD stage traversal order; fixed joints
+follow and retain their own relative stage order. It does not apply
+`unitree_g1_29dof` compatibility ordering; that is a FoCoDyn load-time choice.
+After reviewing the temporary output, regenerate the checked-in companions in
+place with `--force`:
+
+```bash
+uv run --python 3.12 --extra usd python \
+  tools/convert_g1_usd_to_urdf.py \
+  src/focodyn/assets/robots/unitree_g1/g1_37dof_minimal.usd \
+  src/focodyn/assets/robots/unitree_g1 \
+  --force
+```
+
+The tool refuses to overwrite existing URDF companions unless `--force` is
+given. Verify regenerated assets before committing them:
+
+```bash
+shasum -a 256 src/focodyn/assets/robots/unitree_g1/g1_37dof_minimal.usd
+uv run --extra dev pytest -q \
+  tests/test_assets.py \
+  tests/test_contacts.py \
+  tests/test_dynamics.py \
+  tests/test_motion.py
+uv build --wheel
+unzip -l dist/focodyn-0.1.0-py3-none-any.whl | \
+  grep g1_37dof_minimal
+```
+
+The expected SHA-256 is
+`4f5e0600f24bed04d4c45b3921b6f3d7b6205463b0b1ac051cf2883dd3aaee67`.
+The tests enforce the `pelvis` root, 37 joints, the bundled USD source order,
+contact geometry, motion mappings, dynamics dimensions, and source checksum.
+Treat any generated physical-metadata change as a reviewed asset migration
+rather than accepting it mechanically.
+
 The default bundled sample kinematic motion under
 `src/focodyn/assets/motions/g1_fleaven_retargeted` is
 `g1/Transitions_mocap/mazen_c3d/JOOF_walk_poses_120_jpos.npy` from
@@ -305,11 +444,11 @@ That dataset is distributed under CC-BY-4.0 and contains AMASS motions
 retargeted to Unitree G1. The original CMU source motion is from the
 [CMU Graphics Lab Motion Capture Database](https://mocap.cs.cmu.edu/).
 
-Files ending in `.adam.urdf` are generated compatibility copies of the upstream
-URDFs. They add identity joint origins where the upstream URDF omits them and
-remove Unitree/MuJoCo-specific XML that `urdf_parser_py` warns about. The
-original upstream URDFs remain vendored unchanged and are used for source
-inspection and visualization.
+Files ending in `.adam.urdf` are generated compatibility copies. For upstream
+URDFs, they add identity joint origins where needed and remove
+Unitree/MuJoCo-specific XML that `urdf_parser_py` warns about. For the bundled
+USD model, they accompany the generated visualization URDF. Original upstream
+URDFs and the supplied USD remain vendored unchanged for source inspection.
 
 The visualization uses [Viser](https://viser.studio/) when the optional
 `viz` extra is installed. Whittaker-Eilers derivatives use

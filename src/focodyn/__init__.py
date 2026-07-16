@@ -27,6 +27,11 @@ from .input_constraints import (
     PositiveNormalContactForces,
     StaticAffineInputConstraint,
 )
+from .joint_conventions import (
+    JointOrder,
+    map_g1_29dof_to_37dof,
+    map_g1_37dof_to_29dof,
+)
 from .motion import (
     KinematicMotionReference,
     bundled_motion_reference_path,
@@ -52,6 +57,7 @@ __all__ = [
     "PositiveNormalContactForces",
     "LinearizedFrictionCone",
     "RobotAsset",
+    "JointOrder",
     "FloatingBaseContactModel",
     "FlatTerrainContactDetector",
     "BasicContactForceResolver",
@@ -68,6 +74,8 @@ __all__ = [
     "estimate_motion_derivatives",
     "load_asset",
     "load_kinematic_motion_reference",
+    "map_g1_29dof_to_37dof",
+    "map_g1_37dof_to_29dof",
     "plot_fixed_contact_force_analysis",
     "simple_walking_sequence",
 ]
