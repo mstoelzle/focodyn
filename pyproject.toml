@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "adam-robotics[pytorch]>=0.5.0",
     "numpy>=1.26",
-    "torch>=2.3",
+    "torch>=2.13.0",
     "torch-dxdt>=0.1.1",
 ]
 
